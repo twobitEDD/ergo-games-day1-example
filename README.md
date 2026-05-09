@@ -172,8 +172,8 @@ DAY1_CHAIN_MODE=ergo                 # ergo (default in .env.mainnet.example) or
 DAY1_CHAIN_NETWORK=mainnet           # mainnet default
 DAY1_SERVER_WALLET_BALANCE_NANOERG=1000000000
 DAY1_ERGO_SIGNING_MODE=external      # external (default), direct, or public-sponsor
-DAY1_ERGO_NODE_URL=https://your-mainnet-node.example.com:9053
-DAY1_ERGO_EXPLORER_URL=https://api.ergoplatform.com
+DAY1_ERGO_NODE_URL=https://api-testnet.ergoplatform.com
+DAY1_ERGO_EXPLORER_URL=https://api-testnet.ergoplatform.com
 DAY1_RATIFY_FINALITY_DEPTH=6
 
 # Ratification cadence and batching
@@ -304,6 +304,8 @@ NODE_ENV=production
 DAY1_API_PORT=$PORT
 DAY1_CORS_ALLOWED_ORIGINS=https://<your-railway-domain>
 DAY1_TOTP_ENCRYPTION_KEY=<strong-random-value>
+DAY1_CHAIN_NETWORK=testnet
+DAY1_ERGO_NODE_URL=https://api-testnet.ergoplatform.com
 ```
 
 If frontend and API are split across different domains, set

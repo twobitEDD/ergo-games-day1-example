@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "sync:account-model": "node -e \"const { existsSync } = require('node:fs'); const { execSync } = require('node:child_process'); if (existsSync('../ergo-account-model/package.json')) { execSync('npm --prefix ../ergo-account-model run build', { stdio: 'inherit' }); } else { console.log('Skipping local account-model sync; using published package.'); }\"",
     "predev": "npm run sync:account-model",
