@@ -1,0 +1,91 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --scroll-progress: 0;
+  --scroll-y: 0px;
+  --color-bg: #f8f6ff;
+  --color-bg-accent: #fef7ef;
+  --color-surface: rgba(255, 255, 255, 0.9);
+  --color-surface-strong: #ffffff;
+  --color-border: #d9d8f3;
+  --color-border-soft: #e9e8fb;
+  --color-text-strong: #1f2937;
+  --color-text-muted: #4b5563;
+  --color-focus-ring: #7c83f2;
+  --color-cta-1: #f8c6da;
+  --color-cta-2: #b8d9ff;
+  --color-cta-3: #c9f1d9;
+  --color-cta-border: #b7b4e3;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background:
+    radial-gradient(circle at 20% 10%, rgba(248, 198, 218, 0.35), transparent 38%),
+    radial-gradient(circle at 80% 0%, rgba(184, 217, 255, 0.4), transparent 42%),
+    linear-gradient(180deg, var(--color-bg), var(--color-bg-accent));
+  color: var(--color-text-strong);
+  min-height: 100vh;
+}
+
+#root {
+  position: relative;
+  isolation: isolate;
+  min-height: 100vh;
+}
+
+#root::before,
+#root::after {
+  content: "";
+  position: fixed;
+  pointer-events: none;
+  z-index: -1;
+  will-change: transform, opacity;
+}
+
+#root::before {
+  width: 42rem;
+  height: 42rem;
+  left: -14rem;
+  top: -12rem;
+  background:
+    radial-gradient(circle at 35% 35%, rgba(248, 198, 218, 0.5), transparent 62%),
+    radial-gradient(circle at 75% 72%, rgba(184, 217, 255, 0.45), transparent 56%),
+    radial-gradient(circle at 45% 80%, rgba(201, 241, 217, 0.42), transparent 62%);
+  filter: blur(16px);
+  opacity: calc(0.62 + (var(--scroll-progress) * 0.15));
+  transform: translate3d(
+    calc(var(--scroll-progress) * 6vw),
+    calc(var(--scroll-progress) * 12vh),
+    0
+  ) rotate(calc(var(--scroll-progress) * 10deg));
+}
+
+#root::after {
+  width: 34rem;
+  height: 34rem;
+  right: -10rem;
+  top: 24vh;
+  background:
+    radial-gradient(circle at 38% 42%, rgba(184, 217, 255, 0.36), transparent 62%),
+    radial-gradient(circle at 64% 72%, rgba(248, 198, 218, 0.42), transparent 56%),
+    radial-gradient(circle at 28% 72%, rgba(201, 241, 217, 0.3), transparent 58%);
+  filter: blur(20px);
+  opacity: calc(0.45 + (var(--scroll-progress) * 0.2));
+  transform: translate3d(
+    calc(var(--scroll-progress) * -8vw),
+    calc(var(--scroll-progress) * 9vh),
+    0
+  ) rotate(calc(var(--scroll-progress) * -8deg));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #root::before,
+  #root::after {
+    transform: none;
+    opacity: 0.45;
+  }
+}
