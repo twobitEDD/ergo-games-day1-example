@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  buildAccountConversionSnapshot,
   buildAccountExportArtifact,
   buildAccountSession,
-  buildAccountStateSnapshot,
   type WalletSourceKind,
 } from "@twobitedd/ergo-account-model";
 import { DynamicWidget, getAuthToken } from "@dynamic-labs/sdk-react-core";
@@ -297,14 +295,18 @@ function App() {
     });
   }, [profile, exportVaultCandidate, dynamicUser]);
   const accountStateSnapshot = useMemo(
-    () => accountModelSession.state ?? buildAccountStateSnapshot({ session: accountModelSession }),
-    [accountModelSession]
+    () => ({
+      accountType: accountModelSession.identity.ergoAddress ? "wallet-linked" : "identity-only",
+      accountId: profile?.userId ?? null,
+      externalAuthRef: dynamicUser?.userId ?? dynamicUser?.email ?? null,
+    }),
+    [accountModelSession.identity.ergoAddress, profile?.userId, dynamicUser]
   );
   const accountConversionSnapshot = useMemo(
-    () =>
-      accountModelSession.conversion ??
-      buildAccountConversionSnapshot({ session: accountModelSession, state: accountStateSnapshot }),
-    [accountModelSession, accountStateSnapshot]
+    () => ({
+      targetType: accountStateSnapshot.accountType === "wallet-linked" ? "wallet-linked" : "identity-only",
+    }),
+    [accountStateSnapshot.accountType]
   );
 
   const withBusy = async (run: () => Promise<void>) => {
