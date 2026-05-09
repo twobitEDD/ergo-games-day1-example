@@ -11,7 +11,8 @@ No-wager local-first MVP foundation for Tic-Tac-Toe with:
 ## Primetime-Foundation Hardening Included
 
 - Persistent storage for accounts, sessions, games, moves/events, rewards, and leaderboard stats
-- Explicit `register` / `login` auth routes
+- Dynamic-first auth bridge with guest fallback bootstrap
+- Legacy `register` / `login` auth routes retained for compatibility/testing
 - Password hashing via Node `scrypt` (salted)
 - Cookie-backed session handling (HTTP-only, same-site, secure in production mode)
 - CSRF token issuance + validation on cookie-authenticated mutating routes
@@ -45,9 +46,11 @@ Flow (text diagram):
 
 ### Auth and account
 
+- `POST /api/auth/dynamic/login` (primary)
+- `POST /api/auth/guest` (guest fallback)
 - `POST /api/auth/register`
 - `POST /api/auth/login`
-- `POST /api/auth/dynamic/login`
+- `POST /api/auth/sync` (legacy bootstrap compatibility)
 - `POST /api/auth/csrf` (rotate CSRF token for cookie-auth clients)
 - `POST /api/auth/recovery/request`
 - `POST /api/auth/recovery/reset`
@@ -105,6 +108,26 @@ npm install
 cp .env.example .env.local
 npm run db:init
 npm run dev
+```
+
+### Dynamic-first + guest fallback
+
+Day1 setup is now intentionally Dynamic-first:
+
+1. Authenticate in Dynamic widget (primary path), then click `Dynamic -> Day1 Session`.
+2. If Dynamic is unavailable/misconfigured, use `Continue as Guest` to bootstrap a local guest session.
+
+Legacy email/password endpoints still exist for compatibility and tests, but they are no longer part of the main Day1 setup UX.
+
+Minimal required env vars for Dynamic-first:
+
+```bash
+DAY1_DYNAMIC_AUTH_ENABLED=true
+DAY1_DYNAMIC_JWT_ISSUER=<issuer-from-dynamic>
+DAY1_DYNAMIC_JWT_AUDIENCE=<audience-from-dynamic>
+DAY1_DYNAMIC_JWKS_URL=<jwks-url-from-dynamic>
+VITE_DAY1_DYNAMIC_ENABLED=true
+VITE_DYNAMIC_ENVIRONMENT_ID=<dynamic-environment-id>
 ```
 
 ### Railway/npm dependency strings
@@ -208,11 +231,11 @@ Optional env for deterministic TOTP secret encryption key (recommended outside l
 DAY1_TOTP_ENCRYPTION_KEY=replace-with-strong-key npm run dev:server
 ```
 
-### Dynamic.xyz Login Bridge (Optional)
+### Dynamic.xyz Login Bridge (Primary) + Guest Fallback
 
-Day1 can accept a Dynamic auth JWT and convert it into the existing local Day1
-cookie+CSRF session model. Dynamic remains an onboarding/auth entry point while
-local Day1 accounts/sessions stay authoritative.
+Day1 accepts a Dynamic auth JWT and converts it into the existing local Day1
+cookie+CSRF session model. Dynamic is the primary onboarding/auth entry point
+while local Day1 accounts/sessions remain authoritative and provider-agnostic.
 
 Required env:
 
@@ -234,7 +257,8 @@ Required Dynamic dashboard settings for local Day1:
 - Allowed redirect/domain entries should include the same localhost hosts used above.
 - JWT issuer/audience/JWKS values copied to Day1 server env must match Dynamic JWT settings exactly.
 
-If these values are missing/mismatched, the frontend now degrades Dynamic to a non-blocking mode and keeps Day1 local auth/gameplay paths active.
+If these values are missing/mismatched, the frontend degrades Dynamic to a
+non-blocking mode and keeps guest bootstrap + local gameplay paths active.
 
 Flow:
 
@@ -245,8 +269,14 @@ Flow:
    then issues the same Day1 cookie + CSRF session payload used by existing auth
    endpoints.
 
-This keeps existing `register`/`login` paths working and preserves a no-lock-in
-path: local account/session records remain usable even if Dynamic is disabled.
+Guest fallback:
+
+1. Frontend calls `POST /api/auth/guest` when user selects `Continue as Guest`.
+2. Server creates a local guest identity and issues Day1 cookie + CSRF session.
+
+This keeps a no-lock-in path: local account/session records remain usable even
+if Dynamic is disabled, and legacy `register`/`login` routes remain available
+for compatibility/testing.
 
 ### Wallet Backup Export (Client-Side)
 

@@ -232,6 +232,21 @@ test("dynamic login links by email and creates a day1 session", async () => {
   }
 });
 
+test("guest login creates a local session without dynamic token", async () => {
+  const { client, cleanup } = createTestContext();
+  try {
+    const guest = await client.post("/api/auth/guest").send({ displayName: "Guest Flow" }).expect(201);
+    assert.equal(guest.body.authMode, "guest");
+    assert.equal(guest.body.profile.displayName, "Guest Flow");
+    assert.match(guest.body.profile.email as string, /^guest-/);
+
+    const session = await client.get("/api/auth/session").expect(200);
+    assert.equal(session.body.session.userId, guest.body.session.userId);
+  } finally {
+    cleanup();
+  }
+});
+
 test("login endpoint applies brute-force throttle scaffold", async () => {
   const { client, cleanup } = createTestContext();
   try {

@@ -1,6 +1,6 @@
 import { createContext, useContext } from "react";
 
-export type DynamicAvailability = "disabled" | "misconfigured" | "initializing" | "ready" | "degraded";
+export type DynamicAvailability = "disabled" | "misconfigured" | "idle" | "initializing" | "ready" | "degraded";
 
 export interface Day1DynamicContextValue {
   enabled: boolean;
@@ -11,7 +11,9 @@ export interface Day1DynamicContextValue {
   reason: string | null;
   sdkHasLoaded: boolean;
   user: Record<string, unknown> | null;
+  requestActivation: () => void;
   openAuthFlow: () => void;
+  getAuthToken: () => string | null;
   signOut: () => Promise<void>;
 }
 
@@ -24,9 +26,13 @@ export const DEFAULT_DAY1_DYNAMIC_CONTEXT: Day1DynamicContextValue = {
   reason: "Dynamic login disabled. Set VITE_DAY1_DYNAMIC_ENABLED=true to enable.",
   sdkHasLoaded: false,
   user: null,
+  requestActivation: () => {
+    // no-op fallback when Dynamic is disabled/unavailable
+  },
   openAuthFlow: () => {
     // no-op fallback when Dynamic is disabled/unavailable
   },
+  getAuthToken: () => null,
   signOut: async () => {
     // no-op fallback when Dynamic is disabled/unavailable
   },

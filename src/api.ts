@@ -315,6 +315,22 @@ export const apiDynamicLogin = (payload: {
     body: JSON.stringify(payload),
   });
 
+export const apiGuestLogin = (displayName = "Guest Player") =>
+  fetchJson<{
+    scaffold: true;
+    session: ApiSession;
+    profile: ApiProfile;
+    sessionHeader: string;
+    sessionCookie: string;
+    csrfHeader: string;
+    csrfToken: string;
+    deviceHeader: string;
+    authMode: "guest";
+  }>("/api/auth/guest", {
+    method: "POST",
+    body: JSON.stringify({ displayName }),
+  });
+
 export const apiAuthSync = (displayName: string) =>
   fetchJson<{
     scaffold: true;

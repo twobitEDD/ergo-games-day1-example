@@ -545,6 +545,40 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     deviceHeader: DEVICE_HEADER,
   });
 
+  const createGuestSessionPayload = (
+    req: express.Request,
+    res: express.Response,
+    displayNameRaw: string,
+    authMode: "guest" | "sync_bootstrap"
+  ) => {
+    const displayName = normalizeDisplayName(displayNameRaw) || "Guest Player";
+    const email = `guest-${randomUUID().slice(0, 10)}@local.day1`;
+    const passwordSalt = randomUUID().replaceAll("-", "");
+    const profile = store.createAccount({
+      email,
+      displayName,
+      passwordSalt,
+      passwordHash: hashPassword(randomUUID().replaceAll("-", ""), passwordSalt),
+    });
+    if (!profile) {
+      res.status(500).json({ error: "GUEST_BOOTSTRAP_FAILED" });
+      return null;
+    }
+    const { session, sessionToken, csrfToken } = store.createSessionForUser(profile.userId, {
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+      deviceId: normalizeDeviceId(req.headers[DEVICE_HEADER]),
+    });
+    writeSessionCookie(res, sessionToken);
+    logSecurityEvent(req, {
+      eventType: authMode === "guest" ? "AUTH_GUEST_LOGIN" : "AUTH_SYNC",
+      userId: profile.userId,
+      sessionId: session.sessionId,
+      outcome: "SUCCESS",
+    });
+    return { ...buildAuthSuccessPayload(session, profile, csrfToken), authMode };
+  };
+
   app.get("/api/health", (_req, res) => {
     const walletStatus = walletManager.getStatus();
     const dbReadiness = store.checkDatabaseReadiness();
@@ -844,29 +878,21 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     });
   });
 
+  app.post("/api/auth/guest", (req, res) => {
+    const payload = createGuestSessionPayload(req, res, String(req.body?.displayName ?? "Guest Player"), "guest");
+    if (!payload) return;
+    res.status(201).json(payload);
+  });
+
   app.post("/api/auth/sync", (req, res) => {
-    const displayName = normalizeDisplayName(String(req.body?.displayName ?? "Day1 Player"));
-    const email = `sync-${randomUUID().slice(0, 10)}@local.day1`;
-    const password = randomUUID().replaceAll("-", "");
-    const passwordSalt = randomUUID().replaceAll("-", "");
-    const profile = store.createAccount({
-      email,
-      displayName,
-      passwordSalt,
-      passwordHash: hashPassword(password, passwordSalt),
-    });
-    if (!profile) {
-      res.status(500).json({ error: "SYNC_BOOTSTRAP_FAILED" });
-      return;
-    }
-    const { session, sessionToken, csrfToken } = store.createSessionForUser(profile.userId, {
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-      deviceId: normalizeDeviceId(req.headers[DEVICE_HEADER]),
-    });
-    writeSessionCookie(res, sessionToken);
-    logSecurityEvent(req, { eventType: "AUTH_SYNC", userId: profile.userId, sessionId: session.sessionId, outcome: "SUCCESS" });
-    res.status(201).json({ ...buildAuthSuccessPayload(session, profile, csrfToken), authMode: "sync_bootstrap" });
+    const payload = createGuestSessionPayload(
+      req,
+      res,
+      String(req.body?.displayName ?? "Guest Player"),
+      "sync_bootstrap"
+    );
+    if (!payload) return;
+    res.status(201).json(payload);
   });
 
   app.get("/api/auth/session", (req, res) => {

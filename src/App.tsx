@@ -1,14 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildAccountExportArtifact,
   buildAccountSession,
   type WalletSourceKind,
 } from "@twobitedd/ergo-account-model";
-import { DynamicWidget, getAuthToken } from "@dynamic-labs/sdk-react-core";
 import { CELL_EMPTY, CELL_O, CELL_X, statusOf, type Board, type GameType, type GameTypeMetadata } from "@twobitedd/ergo-games-interface";
 import {
-  apiRegister,
-  apiLogin,
+  apiGuestLogin,
   apiDynamicLogin,
   apiBindWallet,
   apiCreateGame,
@@ -67,6 +65,10 @@ import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
 const ENCRYPTED_VAULT_DYNAMIC_METADATA_KEY = "ergoVaultV1";
+const LIVE_SYNC_INTERVAL_MS = 4000;
+const LazyDynamicWidget = lazy(() =>
+  import("./DynamicWidgetSlot").then((module) => ({ default: module.DynamicWidgetSlot }))
+);
 
 interface EncryptedVaultRecord {
   v: number;
@@ -151,18 +153,23 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
   const lastName = typeof dynamicUser?.lastName === "string" ? dynamicUser.lastName : "";
   const dynamicDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim() || dynamicEmail;
   const handleSync = () => {
-    const authToken = getAuthToken();
+    const authToken = dynamic.getAuthToken();
     if (!authToken) return;
     onSync({ authToken, email: dynamicEmail, displayName: dynamicDisplayName || undefined });
   };
   const sdkReady = dynamic.active && dynamic.sdkHasLoaded;
-  const authTokenReady = sdkReady && Boolean(getAuthToken());
+  const authTokenReady = sdkReady && Boolean(dynamic.getAuthToken());
 
   return (
     <div className="row">
-      <button type="button" disabled={busy || !sdkReady} onClick={dynamic.openAuthFlow}>
+      <button type="button" disabled={busy || !dynamic.enabled || !dynamic.configured} onClick={dynamic.openAuthFlow}>
         Open Dynamic Auth
       </button>
+      {dynamic.availability === "idle" ? (
+        <button type="button" disabled={busy || !dynamic.enabled || !dynamic.configured} onClick={dynamic.requestActivation}>
+          Enable Dynamic Auth Module
+        </button>
+      ) : null}
       <button type="button" disabled={busy || !authTokenReady} onClick={handleSync}>
         Dynamic -&gt; Day1 Session
       </button>
@@ -172,7 +179,11 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
       <small>
         Dynamic user: {dynamicEmail ?? "not authenticated"} | Day1 session: {isSignedIn ? "active" : "none"}
       </small>
-      {dynamic.active ? <DynamicWidget /> : null}
+      {dynamic.active ? (
+        <Suspense fallback={<small>Loading Dynamic UI...</small>}>
+          <LazyDynamicWidget />
+        </Suspense>
+      ) : null}
     </div>
   );
 };
@@ -180,11 +191,6 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
 function App() {
   const dynamic = useDay1Dynamic();
   const dynamicUser = dynamic.user;
-  const [registerDisplayName, setRegisterDisplayName] = useState("Day1 Player");
-  const [registerEmail, setRegisterEmail] = useState("player@example.local");
-  const [registerPassword, setRegisterPassword] = useState("localpass123");
-  const [loginEmail, setLoginEmail] = useState("player@example.local");
-  const [loginPassword, setLoginPassword] = useState("localpass123");
   const [walletAddress, setWalletAddress] = useState("");
   const [backendSession, setBackendSession] = useState<ApiSession | null>(null);
   const [profile, setProfile] = useState<ApiProfile | null>(null);
@@ -217,7 +223,7 @@ function App() {
   const [ratificationIntervalMs, setRatificationIntervalMs] = useState("20000");
   const [signedBatchId, setSignedBatchId] = useState("");
   const [signedTxHex, setSignedTxHex] = useState("");
-  const [eventLog, setEventLog] = useState("Ready. Register or login to begin.");
+  const [eventLog, setEventLog] = useState("Ready. Sign in with Dynamic or start as guest.");
   const [lastBackupExportAt, setLastBackupExportAt] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
@@ -256,6 +262,9 @@ function App() {
     if (dynamic.availability === "initializing") {
       return "Dynamic is initializing. If it remains unavailable, verify dashboard origins include http://localhost:5173 and reload.";
     }
+    if (dynamic.availability === "idle") {
+      return "Dynamic login is available but deferred. Enable the Dynamic module to activate wallet/auth SDKs.";
+    }
     if (dynamic.availability === "disabled") {
       return "Dynamic login is disabled. Set VITE_DAY1_DYNAMIC_ENABLED=true and VITE_DYNAMIC_ENVIRONMENT_ID=<your-env-id> to turn it on.";
     }
@@ -265,6 +274,14 @@ function App() {
     return `${dynamic.reason ?? "Dynamic is unavailable."} Fix Dynamic dashboard origins/domains and verify env values before retrying.`;
   }, [dynamic.availability, dynamic.reason]);
   const exportVaultCandidate = useMemo(() => loadExportVaultCandidate(dynamicUser), [dynamicUser]);
+  const externalAuthRef =
+    (typeof dynamicUser?.userId === "string" && dynamicUser.userId.trim()
+      ? dynamicUser.userId
+      : typeof dynamicUser?.email === "string" && dynamicUser.email.trim()
+        ? dynamicUser.email
+        : profile?.userId
+          ? `day1:${profile.userId}`
+          : null);
   const accountModelSession = useMemo(() => {
     const walletSource: WalletSourceKind = profile?.walletStatus === "bound_stub" ? "nautilus-direct" : null;
     return buildAccountSession({
@@ -272,12 +289,12 @@ function App() {
       walletSource,
       ergoAddress: profile?.walletAddress ?? null,
       accountId: profile?.userId ?? null,
-      externalAuthRef: dynamicUser?.userId ?? dynamicUser?.email ?? null,
+      externalAuthRef,
       dynamicUser: profile
         ? {
             id: profile.userId,
             email: profile.email,
-            externalAuthRef: dynamicUser?.userId ?? dynamicUser?.email ?? undefined,
+            externalAuthRef: externalAuthRef ?? undefined,
           }
         : null,
       vault: exportVaultCandidate
@@ -293,14 +310,14 @@ function App() {
         : null,
       nautilusApiAvailable: typeof window !== "undefined" && Boolean((window as { ergo?: unknown }).ergo),
     });
-  }, [profile, exportVaultCandidate, dynamicUser]);
+  }, [profile, exportVaultCandidate, externalAuthRef]);
   const accountStateSnapshot = useMemo(
     () => ({
       accountType: accountModelSession.identity.ergoAddress ? "wallet-linked" : "identity-only",
       accountId: profile?.userId ?? null,
-      externalAuthRef: dynamicUser?.userId ?? dynamicUser?.email ?? null,
+      externalAuthRef,
     }),
-    [accountModelSession.identity.ergoAddress, profile?.userId, dynamicUser]
+    [accountModelSession.identity.ergoAddress, externalAuthRef, profile?.userId]
   );
   const accountConversionSnapshot = useMemo(
     () => ({
@@ -440,7 +457,7 @@ function App() {
     void syncLobby();
     const interval = window.setInterval(() => {
       void syncLobby();
-    }, 1200);
+    }, LIVE_SYNC_INTERVAL_MS);
 
     return () => {
       disposed = true;
@@ -471,7 +488,7 @@ function App() {
     void syncGameState();
     const interval = window.setInterval(() => {
       void syncGameState();
-    }, 1200);
+    }, LIVE_SYNC_INTERVAL_MS);
 
     return () => {
       disposed = true;
@@ -512,27 +529,13 @@ function App() {
     };
   }, []);
 
-  const handleRegister = () => {
+  const handleGuestLogin = () => {
     void withBusy(async () => {
-      const payload = await apiRegister({
-        displayName: registerDisplayName,
-        email: registerEmail,
-        password: registerPassword,
-      });
+      const payload = await apiGuestLogin("Guest Player");
       setBackendSession(payload.session);
       setProfile(payload.profile);
       await Promise.all([refreshLobbyAndDirectory(), refreshSecurityPosture(), refreshRatificationState()]);
-      setEventLog(`Account created and signed in as ${payload.profile.displayName}.`);
-    });
-  };
-
-  const handleLogin = () => {
-    void withBusy(async () => {
-      const payload = await apiLogin({ email: loginEmail, password: loginPassword });
-      setBackendSession(payload.session);
-      setProfile(payload.profile);
-      await Promise.all([refreshLobbyAndDirectory(), refreshSecurityPosture(), refreshRatificationState()]);
-      setEventLog(`Logged in as ${payload.profile.displayName}.`);
+      setEventLog(`Guest session active as ${payload.profile.displayName}.`);
     });
   };
 
@@ -877,44 +880,17 @@ function App() {
       <section className="panel">
         <h2>1) Account Access</h2>
         <p className="panelHint">
-          Register and login are explicit endpoints. Wallet binding is optional and separate.
+          Dynamic.xyz is the primary sign-in path. Guest mode is available for no-setup local testing.
         </p>
-        <div className="row">
-          <input
-            value={registerDisplayName}
-            onChange={(event) => setRegisterDisplayName(event.target.value)}
-            placeholder="Display name"
-          />
-          <input
-            value={registerEmail}
-            onChange={(event) => setRegisterEmail(event.target.value)}
-            placeholder="Email"
-          />
-          <input
-            value={registerPassword}
-            onChange={(event) => setRegisterPassword(event.target.value)}
-            placeholder="Password (min 8)"
-            type="password"
-          />
-          <button type="button" disabled={busy || isSignedIn} onClick={handleRegister}>
-            Register
-          </button>
-        </div>
-        <div className="row">
-          <input value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} placeholder="Email" />
-          <input
-            value={loginPassword}
-            onChange={(event) => setLoginPassword(event.target.value)}
-            placeholder="Password"
-            type="password"
-          />
-          <button type="button" disabled={busy || isSignedIn} onClick={handleLogin}>
-            Login
-          </button>
-        </div>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
           <DynamicLoginPanel busy={busy} isSignedIn={isSignedIn} onSync={handleDynamicLogin} />
         ) : null}
+        <div className="row">
+          <button type="button" disabled={busy || isSignedIn} onClick={handleGuestLogin}>
+            Continue as Guest
+          </button>
+          <small>Legacy email/password auth endpoints stay server-compatible but are not part of Day1 setup UX.</small>
+        </div>
         {dynamicStatusMessage ? (
           <p className={`dynamicStatus dynamicStatus--${dynamic.availability}`}>
             {dynamicStatusMessage}
@@ -927,26 +903,31 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>2) Account Recovery Scaffold</h2>
-        <p className="panelHint">Request reset token and complete one-time password reset in local dev.</p>
-        <div className="row">
-          <input value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="Recovery email" />
-          <button type="button" disabled={busy} onClick={handleRecoveryRequest}>
-            Request Recovery
-          </button>
-        </div>
-        <div className="row">
-          <input value={recoveryToken} onChange={(event) => setRecoveryToken(event.target.value)} placeholder="Reset token" />
-          <input
-            value={recoveryNewPassword}
-            onChange={(event) => setRecoveryNewPassword(event.target.value)}
-            placeholder="New password"
-            type="password"
-          />
-          <button type="button" disabled={busy || !recoveryToken.trim()} onClick={handleRecoveryReset}>
-            Reset Password
-          </button>
-        </div>
+        <h2>2) Legacy Local Auth (Optional)</h2>
+        <p className="panelHint">
+          Day1 setup does not require email/password flows. These controls remain for compatibility testing only.
+        </p>
+        <details>
+          <summary>Open legacy password recovery controls</summary>
+          <div className="row">
+            <input value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="Recovery email" />
+            <button type="button" disabled={busy} onClick={handleRecoveryRequest}>
+              Request Recovery
+            </button>
+          </div>
+          <div className="row">
+            <input value={recoveryToken} onChange={(event) => setRecoveryToken(event.target.value)} placeholder="Reset token" />
+            <input
+              value={recoveryNewPassword}
+              onChange={(event) => setRecoveryNewPassword(event.target.value)}
+              placeholder="New password"
+              type="password"
+            />
+            <button type="button" disabled={busy || !recoveryToken.trim()} onClick={handleRecoveryReset}>
+              Reset Password
+            </button>
+          </div>
+        </details>
       </section>
 
       <section className="panel">
