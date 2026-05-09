@@ -6,7 +6,8 @@ import { loadDay1Env } from "./env";
 
 loadDay1Env();
 
-const port = Number(process.env.DAY1_API_PORT ?? 4010);
+const resolvedPort = Number(process.env.PORT ?? process.env.DAY1_API_PORT ?? 4010);
+const port = Number.isFinite(resolvedPort) && resolvedPort > 0 ? resolvedPort : 4010;
 const app = createDay1App();
 const clientDistDir = resolve(process.cwd(), "dist");
 const clientIndexPath = resolve(clientDistDir, "index.html");
