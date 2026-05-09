@@ -293,6 +293,8 @@ npm run dev
 Day1 now includes `railway.json` and `Procfile` so Railway can run it as a
 single web service:
 
+_Deploy note: keeping this section current triggers Railway source redeploys when needed._
+
 1. `npm install`
 2. `npm run build` (creates frontend `dist/` bundle)
 3. `npm run start` (starts API and serves `dist/` when present)
