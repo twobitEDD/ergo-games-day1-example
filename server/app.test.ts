@@ -270,6 +270,132 @@ test("dynamic login can load game types and create game", async () => {
   }
 });
 
+test("cross-origin cookie settings keep dynamic session usable for game-type loading", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  const previousCorsOrigins = process.env.DAY1_CORS_ALLOWED_ORIGINS;
+  const previousCookieSameSite = process.env.DAY1_SESSION_COOKIE_SAME_SITE;
+  const previousCookieSecure = process.env.DAY1_SESSION_COOKIE_SECURE;
+  process.env.NODE_ENV = "production";
+  process.env.DAY1_CORS_ALLOWED_ORIGINS = "https://day1-ui.example.com";
+  process.env.DAY1_SESSION_COOKIE_SAME_SITE = "none";
+  process.env.DAY1_SESSION_COOKIE_SECURE = "false";
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_cross_site_cookie",
+        email: "dynamic-cookie-policy@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Cookie Policy",
+      };
+    },
+  });
+  const client = request(app);
+  try {
+    const origin = "https://day1-ui.example.com";
+    const login = await client
+      .post("/api/auth/dynamic/login")
+      .set("Origin", origin)
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    assert.equal(login.headers["access-control-allow-origin"], origin);
+    assert.equal(login.headers["access-control-allow-credentials"], "true");
+    const cookieHeader = String(login.headers["set-cookie"]?.[0] ?? "");
+    const sessionCookie = cookieHeader.split(";")[0];
+    assert.match(cookieHeader, /SameSite=None/i);
+    assert.doesNotMatch(cookieHeader, /SameSite=Strict/i);
+
+    await request(app).get("/api/auth/session").set("Origin", origin).set("Cookie", sessionCookie).expect(200);
+    const gameTypes = await request(app)
+      .get("/api/game-types")
+      .set("Origin", origin)
+      .set("Cookie", sessionCookie)
+      .expect(200);
+    const supportedTypes = (gameTypes.body.gameTypes as Array<{ gameType: string }>).map((entry) => entry.gameType);
+    assert.ok(supportedTypes.includes("tic_tac_toe"));
+  } finally {
+    if (previousNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = previousNodeEnv;
+    }
+    if (previousCorsOrigins === undefined) {
+      delete process.env.DAY1_CORS_ALLOWED_ORIGINS;
+    } else {
+      process.env.DAY1_CORS_ALLOWED_ORIGINS = previousCorsOrigins;
+    }
+    if (previousCookieSameSite === undefined) {
+      delete process.env.DAY1_SESSION_COOKIE_SAME_SITE;
+    } else {
+      process.env.DAY1_SESSION_COOKIE_SAME_SITE = previousCookieSameSite;
+    }
+    if (previousCookieSecure === undefined) {
+      delete process.env.DAY1_SESSION_COOKIE_SECURE;
+    } else {
+      process.env.DAY1_SESSION_COOKIE_SECURE = previousCookieSecure;
+    }
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("production defaults issue SameSite=None and Secure cookies", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  const previousCookieSameSite = process.env.DAY1_SESSION_COOKIE_SAME_SITE;
+  const previousCookieSecure = process.env.DAY1_SESSION_COOKIE_SECURE;
+  process.env.NODE_ENV = "production";
+  delete process.env.DAY1_SESSION_COOKIE_SAME_SITE;
+  delete process.env.DAY1_SESSION_COOKIE_SECURE;
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_prod_cookie_defaults",
+        email: "dynamic-prod-cookie@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Prod Cookie",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    const login = await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    const cookieHeader = String(login.headers["set-cookie"]?.[0] ?? "");
+    assert.match(cookieHeader, /SameSite=None/i);
+    assert.match(cookieHeader, /Secure/i);
+  } finally {
+    if (previousNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = previousNodeEnv;
+    }
+    if (previousCookieSameSite === undefined) {
+      delete process.env.DAY1_SESSION_COOKIE_SAME_SITE;
+    } else {
+      process.env.DAY1_SESSION_COOKIE_SAME_SITE = previousCookieSameSite;
+    }
+    if (previousCookieSecure === undefined) {
+      delete process.env.DAY1_SESSION_COOKIE_SECURE;
+    } else {
+      process.env.DAY1_SESSION_COOKIE_SECURE = previousCookieSecure;
+    }
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic login rejects conflicts with an already-linked day1 account", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");

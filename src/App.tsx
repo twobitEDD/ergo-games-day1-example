@@ -158,6 +158,14 @@ const isTransientSessionHydrationError = (error: unknown) => {
   );
 };
 
+const deriveGameTypesFailureMessage = (error: unknown) => {
+  if (isTransientSessionHydrationError(error)) {
+    return "Game types could not load because the Day1 session is missing or expired. Re-run Dynamic -> Day1 Session and verify deploy cookie/CORS settings.";
+  }
+  const detail = error instanceof Error ? error.message : String(error ?? "Unknown request failure");
+  return `Game types could not load: ${detail}`;
+};
+
 interface DynamicLoginPanelProps {
   busy: boolean;
   isSignedIn: boolean;
@@ -244,6 +252,8 @@ function App() {
   const [lastBackupExportAt, setLastBackupExportAt] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
+  const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
   const lobbyRequestRef = useRef(0);
 
   const gameStatus = useMemo(() => {
@@ -409,6 +419,8 @@ function App() {
     setSelectedGameType("tic_tac_toe");
     setKnownPlayers([]);
     setLeaderboard([]);
+    setGameTypesLoadState("idle");
+    setGameTypesLoadError(null);
     setGame(null);
     setPlayerSymbol(null);
     setGameStatusFromServer(null);
@@ -467,26 +479,37 @@ function App() {
 
   const fetchLobbyAndDirectorySnapshot = useCallback(async (filter: "all" | "open" | "active" | "completed") => {
     const requestId = ++lobbyRequestRef.current;
-    const gameTypesPayload = await fetchGameTypesWithRetry();
-    const [gamesPayload, playersPayload, leaderboardPayload] = await Promise.allSettled([
-      apiListGames(filter),
-      apiListRecentPlayers(20),
-      apiGetLeaderboard(20),
-    ]);
-    if (requestId !== lobbyRequestRef.current) return;
-    setGameTypes(gameTypesPayload.gameTypes);
-    setSelectedGameType((previous) => {
-      if (gameTypesPayload.gameTypes.some((entry) => entry.gameType === previous)) return previous;
-      return gameTypesPayload.gameTypes[0]?.gameType ?? "tic_tac_toe";
-    });
-    if (gamesPayload.status === "fulfilled") {
-      setGames(gamesPayload.value.games);
-    }
-    if (playersPayload.status === "fulfilled") {
-      setKnownPlayers(playersPayload.value.players);
-    }
-    if (leaderboardPayload.status === "fulfilled") {
-      setLeaderboard(leaderboardPayload.value.leaderboard);
+    setGameTypesLoadState((previous) => (previous === "ready" ? previous : "loading"));
+    setGameTypesLoadError(null);
+    try {
+      const gameTypesPayload = await fetchGameTypesWithRetry();
+      const [gamesPayload, playersPayload, leaderboardPayload] = await Promise.allSettled([
+        apiListGames(filter),
+        apiListRecentPlayers(20),
+        apiGetLeaderboard(20),
+      ]);
+      if (requestId !== lobbyRequestRef.current) return;
+      setGameTypes(gameTypesPayload.gameTypes);
+      setSelectedGameType((previous) => {
+        if (gameTypesPayload.gameTypes.some((entry) => entry.gameType === previous)) return previous;
+        return gameTypesPayload.gameTypes[0]?.gameType ?? "tic_tac_toe";
+      });
+      setGameTypesLoadState("ready");
+      if (gamesPayload.status === "fulfilled") {
+        setGames(gamesPayload.value.games);
+      }
+      if (playersPayload.status === "fulfilled") {
+        setKnownPlayers(playersPayload.value.players);
+      }
+      if (leaderboardPayload.status === "fulfilled") {
+        setLeaderboard(leaderboardPayload.value.leaderboard);
+      }
+    } catch (error) {
+      if (requestId !== lobbyRequestRef.current) return;
+      setGameTypes([]);
+      setGameTypesLoadState("error");
+      setGameTypesLoadError(deriveGameTypesFailureMessage(error));
+      throw error;
     }
   }, [fetchGameTypesWithRetry]);
 
@@ -501,6 +524,12 @@ function App() {
       refreshRatificationState(),
     ]);
     if (lobbyResult.status === "rejected") {
+      if (isTransientSessionHydrationError(lobbyResult.reason)) {
+        resetSessionState(
+          "Day1 session was not retained after login. Re-run Dynamic -> Day1 Session and verify production cookie/CORS configuration."
+        );
+        return { partialFailures: true };
+      }
       throw lobbyResult.reason;
     }
     const nonBlockingFailures = [securityResult, ratificationResult].filter(
@@ -545,8 +574,16 @@ function App() {
       try {
         await fetchLobbyAndDirectorySnapshot(filter);
         if (disposed) return;
-      } catch {
-        // keep previous snapshot on polling failures
+      } catch (error) {
+        if (disposed) return;
+        if (isTransientSessionHydrationError(error)) {
+          resetSessionState(
+            "Day1 session expired while loading game types. Re-authenticate and verify deploy cookie/CORS settings."
+          );
+          return;
+        }
+        setGameTypesLoadState("error");
+        setGameTypesLoadError(deriveGameTypesFailureMessage(error));
       }
     };
 
@@ -1238,7 +1275,13 @@ function App() {
             disabled={busy || !backendSession}
           >
             {gameTypes.length === 0 ? (
-              <option value={selectedGameType}>Loading game types...</option>
+              <option value={selectedGameType}>
+                {gameTypesLoadState === "loading"
+                  ? "Loading game types..."
+                  : gameTypesLoadState === "error"
+                    ? "Game types unavailable"
+                    : "No game types available"}
+              </option>
             ) : (
               gameTypes.map((entry) => (
                 <option key={entry.gameType} value={entry.gameType}>
@@ -1268,6 +1311,7 @@ function App() {
             Refresh Lobby
           </button>
         </div>
+        {gameTypesLoadError ? <p className="dynamicStatus dynamicStatus--degraded">{gameTypesLoadError}</p> : null}
         <div className="gameList">
           {games.length === 0 ? (
             <small>No games found for current filter.</small>

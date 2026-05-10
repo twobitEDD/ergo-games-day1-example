@@ -344,6 +344,18 @@ DAY1_ERGO_NODE_URL=https://api-testnet.ergoplatform.com
 
 If frontend and API are split across different domains, set
 `DAY1_CORS_ALLOWED_ORIGINS` to a comma-separated list of allowed origins.
+Day1 now defaults production cookies to `SameSite=None; Secure` so cross-origin
+frontend sessions can persist after Dynamic login.
+
+Optional cookie overrides:
+
+```bash
+# allowed values: strict | lax | none
+DAY1_SESSION_COOKIE_SAME_SITE=none
+DAY1_SESSION_COOKIE_SECURE=true
+# optional shared cookie scope
+DAY1_SESSION_COOKIE_DOMAIN=
+```
 
 Readiness checks:
 

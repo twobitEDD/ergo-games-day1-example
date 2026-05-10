@@ -39,6 +39,33 @@ const PASSWORD_RESET_MIN_LENGTH = 8;
 const TOTP_STEP_SECONDS = 30;
 const TOTP_DIGITS = 6;
 const DEFAULT_CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"] as const;
+type SessionCookieSameSite = "strict" | "lax" | "none";
+
+const parseBooleanEnv = (value: string | undefined, fallback: boolean) => {
+  if (!value) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
+
+const parseSessionCookieSameSite = (value: string | undefined): SessionCookieSameSite | null => {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "strict" || normalized === "lax" || normalized === "none") {
+    return normalized;
+  }
+  return null;
+};
+
+const resolveSessionCookiePolicy = () => {
+  const isProduction = process.env.NODE_ENV === "production";
+  const sameSite = parseSessionCookieSameSite(process.env.DAY1_SESSION_COOKIE_SAME_SITE) ?? (isProduction ? "none" : "strict");
+  const secureDefault = isProduction || sameSite === "none";
+  const secure = sameSite === "none" ? true : parseBooleanEnv(process.env.DAY1_SESSION_COOKIE_SECURE, secureDefault);
+  const domain = process.env.DAY1_SESSION_COOKIE_DOMAIN?.trim() || undefined;
+  return { sameSite, secure, domain };
+};
 
 const readSessionId = (raw: string | string[] | undefined) =>
   Array.isArray(raw) ? raw[0] : raw;
@@ -232,6 +259,7 @@ interface CreateDay1AppOptions {
 export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOptions = {}) => {
   const app = express();
   const allowedCorsOrigins = new Set(getAllowedCorsOrigins());
+  const sessionCookiePolicy = resolveSessionCookiePolicy();
   const walletManager = new ServerWalletManager();
   const ratificationService = new RatificationService(store, walletManager);
   const rateLimiter = createRateLimiterAdapter(store);
@@ -337,10 +365,11 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   const writeSessionCookie = (res: express.Response, token: string) => {
     res.cookie(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
-      sameSite: "strict",
-      secure: process.env.NODE_ENV === "production",
+      sameSite: sessionCookiePolicy.sameSite,
+      secure: sessionCookiePolicy.secure,
       maxAge: SESSION_COOKIE_MAX_AGE_MS,
       path: "/",
+      domain: sessionCookiePolicy.domain,
       priority: "high",
     });
   };
@@ -348,9 +377,10 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   const clearSessionCookie = (res: express.Response) => {
     res.clearCookie(SESSION_COOKIE_NAME, {
       httpOnly: true,
-      sameSite: "strict",
-      secure: process.env.NODE_ENV === "production",
+      sameSite: sessionCookiePolicy.sameSite,
+      secure: sessionCookiePolicy.secure,
       path: "/",
+      domain: sessionCookiePolicy.domain,
     });
   };
 
