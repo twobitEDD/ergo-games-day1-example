@@ -325,6 +325,7 @@ single web service:
 
 _Deploy note: keeping this section current triggers Railway source redeploys when needed._
 _Build trigger note: commit `bcaa1b7` fixed npm package resolution for Railway._
+_Build trigger note: commit `92f43b0` updates Day1 to consume published `@twobitedd/ergo-account-model@^0.2.0`._
 
 1. `npm install`
 2. `npm run build` (creates frontend `dist/` bundle)
