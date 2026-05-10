@@ -12,9 +12,16 @@ const SESSION_HEADER = "x-day1-session-token";
 const CSRF_HEADER = "x-day1-csrf-token";
 const DEVICE_HEADER = "x-day1-device-id";
 const DEVICE_STORAGE_KEY = "day1_device_id";
+const FALLBACK_API_BASE_PATH = "";
 
 let csrfTokenCache: string | undefined;
 let deviceIdCache: string | undefined;
+let sessionTokenCache: string | undefined;
+
+interface AuthBootstrapPayload {
+  sessionToken?: string;
+  csrfToken?: string;
+}
 
 export interface ApiSession {
   sessionId: string;
@@ -220,6 +227,37 @@ const getDeviceId = () => {
 
 const isMutatingMethod = (method: string) => ["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase());
 
+const parseBooleanEnvFlag = (value: unknown, fallback: boolean) => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
+
+const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
+
+const resolveApiBaseOrigin = () => {
+  const explicitBase = String(import.meta.env.VITE_DAY1_API_BASE_URL ?? "").trim();
+  if (explicitBase) return trimTrailingSlash(explicitBase);
+  if (typeof window === "undefined") return FALLBACK_API_BASE_PATH;
+  const forceSameOriginInProd = parseBooleanEnvFlag(import.meta.env.VITE_DAY1_FORCE_SAME_ORIGIN_API, true);
+  if (import.meta.env.PROD && forceSameOriginInProd) {
+    return window.location.origin;
+  }
+  return FALLBACK_API_BASE_PATH;
+};
+
+const toApiUrl = (path: string) => {
+  if (/^https?:\/\//i.test(path)) return path;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const baseOrigin = resolveApiBaseOrigin();
+  return baseOrigin ? `${baseOrigin}${normalizedPath}` : normalizedPath;
+};
+
+const isAuthBootstrapPayload = (value: unknown): value is AuthBootstrapPayload =>
+  Boolean(value) && typeof value === "object";
+
 const fetchJson = async <T>(
   path: string,
   options: RequestInit = {},
@@ -228,13 +266,14 @@ const fetchJson = async <T>(
   const headers = new Headers(options.headers ?? {});
   headers.set("Content-Type", "application/json");
   headers.set(DEVICE_HEADER, getDeviceId());
-  if (sessionToken) headers.set(SESSION_HEADER, sessionToken);
+  const effectiveSessionToken = sessionToken ?? sessionTokenCache;
+  if (effectiveSessionToken) headers.set(SESSION_HEADER, effectiveSessionToken);
   const method = String(options.method ?? "GET");
   if (isMutatingMethod(method) && csrfTokenCache) {
     headers.set(CSRF_HEADER, csrfTokenCache);
   }
 
-  const response = await fetch(path, {
+  const response = await fetch(toApiUrl(path), {
     ...options,
     headers,
     credentials: "include",
@@ -242,13 +281,22 @@ const fetchJson = async <T>(
 
   if (!response.ok) {
     let detail = `${response.status}`;
+    let errorCode: string | null = null;
     try {
       const body = (await response.json()) as Record<string, unknown>;
-      const errorCode = typeof body.error === "string" ? body.error : null;
+      errorCode = typeof body.error === "string" ? body.error : null;
       const note = typeof body.note === "string" ? body.note : null;
       detail = [errorCode, note].filter(Boolean).join(" - ") || detail;
     } catch {
       // no-op fallback to status code
+    }
+    if (
+      response.status === 401 &&
+      !sessionToken &&
+      sessionTokenCache &&
+      (errorCode === "MISSING_SESSION" || errorCode === "SESSION_NOT_FOUND")
+    ) {
+      sessionTokenCache = undefined;
     }
     throw new Error(`${path} failed (${response.status}): ${detail}`);
   }
@@ -257,6 +305,9 @@ const fetchJson = async <T>(
   if (typeof payload === "object" && payload && "csrfToken" in payload && payload.csrfToken) {
     csrfTokenCache = payload.csrfToken;
   }
+  if (isAuthBootstrapPayload(payload) && typeof payload.sessionToken === "string" && payload.sessionToken.trim()) {
+    sessionTokenCache = payload.sessionToken.trim();
+  }
   return payload;
 };
 
@@ -264,6 +315,7 @@ export const apiRegister = (payload: { displayName: string; email: string; passw
   fetchJson<{
     scaffold: true;
     session: ApiSession;
+    sessionToken: string;
     profile: ApiProfile;
     sessionHeader: string;
     sessionCookie: string;
@@ -285,6 +337,7 @@ export const apiLogin = (payload: {
   fetchJson<{
     scaffold: true;
     session: ApiSession;
+    sessionToken: string;
     profile: ApiProfile;
     sessionHeader: string;
     sessionCookie: string;
@@ -305,6 +358,7 @@ export const apiDynamicLogin = (payload: {
   fetchJson<{
     scaffold: true;
     session: ApiSession;
+    sessionToken: string;
     profile: ApiProfile;
     sessionHeader: string;
     sessionCookie: string;
@@ -321,6 +375,7 @@ export const apiGuestLogin = (displayName = "Guest Player") =>
   fetchJson<{
     scaffold: true;
     session: ApiSession;
+    sessionToken: string;
     profile: ApiProfile;
     sessionHeader: string;
     sessionCookie: string;
@@ -337,6 +392,7 @@ export const apiAuthSync = (displayName: string) =>
   fetchJson<{
     scaffold: true;
     session: ApiSession;
+    sessionToken: string;
     profile: ApiProfile;
     sessionHeader: string;
     sessionCookie: string;
@@ -362,12 +418,21 @@ export const apiGetSession = (sessionToken?: string) =>
     sessionToken
   );
 
-export const apiSignOut = (sessionToken?: string) =>
-  fetchJson<{ scaffold: true; signedOut: true; sessionId: string }>(
+export const apiSignOut = async (sessionToken?: string) => {
+  const payload = await fetchJson<{ scaffold: true; signedOut: true; sessionId: string }>(
     "/api/auth/signout",
     { method: "POST", body: JSON.stringify({}) },
     sessionToken
   );
+  sessionTokenCache = undefined;
+  csrfTokenCache = undefined;
+  return payload;
+};
+
+export const clearClientAuthBootstrap = () => {
+  sessionTokenCache = undefined;
+  csrfTokenCache = undefined;
+};
 
 export const apiGetProfile = (sessionToken?: string) =>
   fetchJson<{ scaffold: true; profile: ApiProfile }>("/api/me/profile", { method: "GET" }, sessionToken);

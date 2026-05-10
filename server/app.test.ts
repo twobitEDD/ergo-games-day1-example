@@ -270,6 +270,42 @@ test("dynamic login can load game types and create game", async () => {
   }
 });
 
+test("dynamic login returns session token fallback for header-auth recovery", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_header_fallback",
+        email: "dynamic-header-fallback@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Header Fallback",
+      };
+    },
+  });
+  try {
+    const login = await request(app)
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    const sessionToken = login.body.sessionToken as string;
+    assert.ok(sessionToken);
+
+    await request(app).get("/api/game-types").set("x-day1-session-token", sessionToken).expect(200);
+    await request(app)
+      .post("/api/game/create")
+      .set("x-day1-session-token", sessionToken)
+      .send({ gameType: "tic_tac_toe" })
+      .expect(201);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("cross-origin cookie settings keep dynamic session usable for game-type loading", async () => {
   const previousNodeEnv = process.env.NODE_ENV;
   const previousCorsOrigins = process.env.DAY1_CORS_ALLOWED_ORIGINS;

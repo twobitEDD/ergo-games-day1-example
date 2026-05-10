@@ -43,6 +43,7 @@ import {
   apiListSessions,
   apiRevokeSession,
   apiGetSecurityMetrics,
+  clearClientAuthBootstrap,
   type ApiGame,
   type ApiSession,
   type ApiProfile,
@@ -166,6 +167,23 @@ const deriveGameTypesFailureMessage = (error: unknown) => {
   return `Game types could not load: ${detail}`;
 };
 
+const FALLBACK_GAME_TYPES: GameTypeMetadata[] = [
+  {
+    gameType: "tic_tac_toe",
+    displayName: "Tic-Tac-Toe",
+    description: "Fallback local mode when game-type registry fetch is unavailable.",
+    supportsMoves: true,
+    maturity: "ga",
+  },
+  {
+    gameType: "coin_flip_demo",
+    displayName: "Coin Flip (Demo Adapter)",
+    description: "Fallback preview adapter while recovering game-type registry fetch.",
+    supportsMoves: false,
+    maturity: "preview",
+  },
+];
+
 interface DynamicLoginPanelProps {
   busy: boolean;
   isSignedIn: boolean;
@@ -254,6 +272,7 @@ function App() {
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
+  const [authBlockingReason, setAuthBlockingReason] = useState<string | null>(null);
   const lobbyRequestRef = useRef(0);
 
   const gameStatus = useMemo(() => {
@@ -411,7 +430,7 @@ function App() {
     throw new Error(guidance);
   };
 
-  const resetSessionState = (reason: string) => {
+  const resetSessionState = useCallback((reason: string) => {
     setBackendSession(null);
     setProfile(null);
     setGames([]);
@@ -440,8 +459,20 @@ function App() {
     setRatificationIntervalMs("20000");
     setSignedBatchId("");
     setSignedTxHex("");
+    setAuthBlockingReason(null);
     setEventLog(reason);
-  };
+  }, []);
+
+  const applyAuthBlockedState = useCallback((reason: string) => {
+    resetSessionState(reason);
+    setAuthBlockingReason(reason);
+    setGameTypes(FALLBACK_GAME_TYPES);
+    setSelectedGameType(FALLBACK_GAME_TYPES[0].gameType);
+    setGameTypesLoadState("error");
+    setGameTypesLoadError(
+      `${reason} Use "Dynamic -> Day1 Session" to re-bootstrap auth, then click "Recover Session + Lobby".`
+    );
+  }, [resetSessionState]);
 
   const hydrateGameState = async (
     gameId: string,
@@ -506,9 +537,15 @@ function App() {
       }
     } catch (error) {
       if (requestId !== lobbyRequestRef.current) return;
-      setGameTypes([]);
+      setGameTypes(FALLBACK_GAME_TYPES);
+      setSelectedGameType((previous) => {
+        if (FALLBACK_GAME_TYPES.some((entry) => entry.gameType === previous)) return previous;
+        return FALLBACK_GAME_TYPES[0].gameType;
+      });
       setGameTypesLoadState("error");
-      setGameTypesLoadError(deriveGameTypesFailureMessage(error));
+      setGameTypesLoadError(
+        `${deriveGameTypesFailureMessage(error)} Fallback game-type options are loaded so you can retry session recovery without a dead end.`
+      );
       throw error;
     }
   }, [fetchGameTypesWithRetry]);
@@ -525,7 +562,7 @@ function App() {
     ]);
     if (lobbyResult.status === "rejected") {
       if (isTransientSessionHydrationError(lobbyResult.reason)) {
-        resetSessionState(
+        applyAuthBlockedState(
           "Day1 session was not retained after login. Re-run Dynamic -> Day1 Session and verify production cookie/CORS configuration."
         );
         return { partialFailures: true };
@@ -577,7 +614,7 @@ function App() {
       } catch (error) {
         if (disposed) return;
         if (isTransientSessionHydrationError(error)) {
-          resetSessionState(
+          applyAuthBlockedState(
             "Day1 session expired while loading game types. Re-authenticate and verify deploy cookie/CORS settings."
           );
           return;
@@ -596,7 +633,7 @@ function App() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [backendSession, lobbyFilter, fetchLobbyAndDirectorySnapshot]);
+  }, [backendSession, lobbyFilter, fetchLobbyAndDirectorySnapshot, applyAuthBlockedState]);
 
   useEffect(() => {
     if (!backendSession || !game?.gameId) return;
@@ -682,6 +719,7 @@ function App() {
     void withBusy(async () => {
       const authToken = await waitForDynamicAuthToken();
       await apiDynamicLogin({ authToken, ...payload });
+      setAuthBlockingReason(null);
       setEventLog("Dynamic login accepted. Verifying backend session...");
       const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic");
       setBackendSession(verifiedSession.session);
@@ -760,6 +798,18 @@ function App() {
     void withBusy(async () => {
       await apiSignOut();
       resetSessionState("Signed out from backend session.");
+    });
+  };
+
+  const handleRecoverSession = () => {
+    void withBusy(async () => {
+      setEventLog("Attempting Day1 session recovery and lobby bootstrap...");
+      const session = await apiGetSession();
+      setBackendSession(session.session);
+      setProfile(session.profile);
+      setAuthBlockingReason(null);
+      await refreshLobbyAndDirectory();
+      setEventLog(`Recovered Day1 session for ${session.profile.displayName}.`);
     });
   };
 
@@ -1064,6 +1114,16 @@ function App() {
           Auth state: {isSignedIn ? "signed in" : "not signed in"} | Session ID:{" "}
           {backendSession?.sessionId ?? "none"}
         </small>
+        {authBlockingReason ? (
+          <p className="dynamicStatus dynamicStatus--degraded">
+            {authBlockingReason} Action: click Dynamic -&gt; Day1 Session, then Recover Session + Lobby.
+          </p>
+        ) : null}
+        <div className="row">
+          <button type="button" disabled={busy} onClick={handleRecoverSession}>
+            Recover Session + Lobby
+          </button>
+        </div>
       </section>
 
       <section className="panel">
@@ -1222,9 +1282,10 @@ function App() {
                 type="button"
                 disabled={busy}
                 onClick={() =>
-                  resetSessionState(
-                    "Local session state reset. Sign in again to create a new backend session."
-                  )
+                  {
+                    clearClientAuthBootstrap();
+                    resetSessionState("Local session state reset. Sign in again to create a new backend session.");
+                  }
                 }
               >
                 Reset Local Session

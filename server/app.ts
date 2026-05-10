@@ -573,10 +573,12 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   const buildAuthSuccessPayload = (
     session: { sessionId: string; userId: string; createdAt: string; expiresAt: string; deviceId?: string; mfaVerifiedAt?: string },
     profile: { userId: string; displayName: string; email: string; walletStatus: string; gamesPlayed: number; wins: number; walletAddress?: string; mfaEnabled?: boolean },
-    csrfToken: string
+    csrfToken: string,
+    sessionToken: string
   ) => ({
     scaffold: true as const,
     session,
+    sessionToken,
     profile,
     sessionHeader: SESSION_HEADER,
     sessionCookie: SESSION_COOKIE_NAME,
@@ -616,7 +618,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       sessionId: session.sessionId,
       outcome: "SUCCESS",
     });
-    return { ...buildAuthSuccessPayload(session, profile, csrfToken), authMode };
+    return { ...buildAuthSuccessPayload(session, profile, csrfToken, sessionToken), authMode };
   };
 
   app.get("/api/health", (_req, res) => {
@@ -735,7 +737,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     });
     writeSessionCookie(res, sessionToken);
     logSecurityEvent(req, { eventType: "AUTH_REGISTER", userId: profile.userId, sessionId: session.sessionId, outcome: "SUCCESS" });
-    res.status(201).json(buildAuthSuccessPayload(session, profile, csrfToken));
+    res.status(201).json(buildAuthSuccessPayload(session, profile, csrfToken, sessionToken));
   });
 
   app.post("/api/auth/login", (req, res) => {
@@ -828,7 +830,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       outcome: "SUCCESS",
       metadata: { mfaEnabled: account.mfaEnabled, trustedDevice },
     });
-    res.json(buildAuthSuccessPayload(session, profile, csrfToken));
+    res.json(buildAuthSuccessPayload(session, profile, csrfToken, sessionToken));
   });
 
   app.post("/api/auth/dynamic/login", async (req, res) => {
@@ -932,7 +934,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       metadata: { emailVerified: claims.emailVerified },
     });
     res.json({
-      ...buildAuthSuccessPayload(session, profile, csrfToken),
+      ...buildAuthSuccessPayload(session, profile, csrfToken, sessionToken),
       authMode: "dynamic",
     });
   });
