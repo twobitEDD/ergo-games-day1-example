@@ -1,7 +1,9 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  buildAccountExportArtifact,
+  buildExportArtifact,
   buildAccountSession,
+  getPortabilityStatus,
+  validateExportArtifact,
   type WalletSourceKind,
 } from "@twobitedd/ergo-account-model";
 import { CELL_EMPTY, CELL_O, CELL_X, statusOf, type Board, type GameType, type GameTypeMetadata } from "@twobitedd/ergo-games-interface";
@@ -66,6 +68,12 @@ import "./App.css";
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
 const ENCRYPTED_VAULT_DYNAMIC_METADATA_KEY = "ergoVaultV1";
 const LIVE_SYNC_INTERVAL_MS = 4000;
+const GAME_TYPES_MAX_RETRIES = 3;
+const GAME_TYPES_RETRY_DELAY_MS = 220;
+const DYNAMIC_TOKEN_MAX_RETRIES = 4;
+const DYNAMIC_TOKEN_RETRY_DELAY_MS = 180;
+const SESSION_VERIFY_MAX_RETRIES = 4;
+const SESSION_VERIFY_RETRY_DELAY_MS = 220;
 const LazyDynamicWidget = lazy(() =>
   import("./DynamicWidgetSlot").then((module) => ({ default: module.DynamicWidgetSlot }))
 );
@@ -139,10 +147,21 @@ const toSymbol = (cell: Board[number]): "" | "X" | "O" => {
   return "";
 };
 
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+const isTransientSessionHydrationError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    message.includes("SESSION_NOT_FOUND") ||
+    message.includes("MISSING_SESSION") ||
+    message.includes("401")
+  );
+};
+
 interface DynamicLoginPanelProps {
   busy: boolean;
   isSignedIn: boolean;
-  onSync: (payload: { authToken: string; email?: string; displayName?: string }) => void;
+  onSync: (payload: { email?: string; displayName?: string }) => void;
 }
 
 const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps) => {
@@ -153,12 +172,10 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
   const lastName = typeof dynamicUser?.lastName === "string" ? dynamicUser.lastName : "";
   const dynamicDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim() || dynamicEmail;
   const handleSync = () => {
-    const authToken = dynamic.getAuthToken();
-    if (!authToken) return;
-    onSync({ authToken, email: dynamicEmail, displayName: dynamicDisplayName || undefined });
+    onSync({ email: dynamicEmail, displayName: dynamicDisplayName || undefined });
   };
   const sdkReady = dynamic.active && dynamic.sdkHasLoaded;
-  const authTokenReady = sdkReady && Boolean(dynamic.getAuthToken());
+  const authTokenReady = sdkReady && Boolean(dynamicUser);
 
   return (
     <div className="row">
@@ -325,6 +342,10 @@ function App() {
     }),
     [accountStateSnapshot.accountType]
   );
+  const portabilityStatus = useMemo(
+    () => getPortabilityStatus({ session: accountModelSession }),
+    [accountModelSession]
+  );
 
   const withBusy = async (run: () => Promise<void>) => {
     setBusy(true);
@@ -345,6 +366,39 @@ function App() {
     setProfile(me.profile);
     await Promise.all([refreshSecurityPosture(), refreshRatificationState()]);
     setEventLog(`Session verified for ${session.profile.displayName}`);
+  };
+
+  const waitForDynamicAuthToken = async () => {
+    for (let attempt = 0; attempt < DYNAMIC_TOKEN_MAX_RETRIES; attempt += 1) {
+      const token = dynamic.getAuthToken()?.trim();
+      if (token) return token;
+      if (attempt < DYNAMIC_TOKEN_MAX_RETRIES - 1) {
+        await sleep(DYNAMIC_TOKEN_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+    throw new Error("Dynamic auth token was unavailable. Re-open Dynamic auth and try again.");
+  };
+
+  const verifyBackendSessionAfterLogin = async (authModeLabel: string) => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < SESSION_VERIFY_MAX_RETRIES; attempt += 1) {
+      try {
+        return await apiGetSession();
+      } catch (error) {
+        lastError = error;
+        const shouldRetry =
+          isTransientSessionHydrationError(error) && attempt < SESSION_VERIFY_MAX_RETRIES - 1;
+        if (!shouldRetry) break;
+        await sleep(SESSION_VERIFY_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+    const guidance =
+      `${authModeLabel} login reached Day1 API, but session hydration was not confirmed. ` +
+      "Verify API origin/CORS and browser cookie policy, then retry.";
+    if (lastError instanceof Error) {
+      throw new Error(`${guidance} (${lastError.message})`);
+    }
+    throw new Error(guidance);
   };
 
   const resetSessionState = (reason: string) => {
@@ -394,23 +448,65 @@ function App() {
     }
   };
 
+  const fetchGameTypesWithRetry = useCallback(async () => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < GAME_TYPES_MAX_RETRIES; attempt += 1) {
+      try {
+        return await apiListGameTypes();
+      } catch (error) {
+        lastError = error;
+        const shouldRetry = isTransientSessionHydrationError(error) && attempt < GAME_TYPES_MAX_RETRIES - 1;
+        if (!shouldRetry) {
+          throw error;
+        }
+        await sleep(GAME_TYPES_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+    throw lastError ?? new Error("Failed to load game types.");
+  }, []);
+
   const fetchLobbyAndDirectorySnapshot = useCallback(async (filter: "all" | "open" | "active" | "completed") => {
     const requestId = ++lobbyRequestRef.current;
-    const [gamesPayload, gameTypesPayload, playersPayload, leaderboardPayload] = await Promise.all([
+    const gameTypesPayload = await fetchGameTypesWithRetry();
+    const [gamesPayload, playersPayload, leaderboardPayload] = await Promise.allSettled([
       apiListGames(filter),
-      apiListGameTypes(),
       apiListRecentPlayers(20),
       apiGetLeaderboard(20),
     ]);
     if (requestId !== lobbyRequestRef.current) return;
-    setGames(gamesPayload.games);
     setGameTypes(gameTypesPayload.gameTypes);
-    setKnownPlayers(playersPayload.players);
-    setLeaderboard(leaderboardPayload.leaderboard);
-  }, []);
+    setSelectedGameType((previous) => {
+      if (gameTypesPayload.gameTypes.some((entry) => entry.gameType === previous)) return previous;
+      return gameTypesPayload.gameTypes[0]?.gameType ?? "tic_tac_toe";
+    });
+    if (gamesPayload.status === "fulfilled") {
+      setGames(gamesPayload.value.games);
+    }
+    if (playersPayload.status === "fulfilled") {
+      setKnownPlayers(playersPayload.value.players);
+    }
+    if (leaderboardPayload.status === "fulfilled") {
+      setLeaderboard(leaderboardPayload.value.leaderboard);
+    }
+  }, [fetchGameTypesWithRetry]);
 
   const refreshLobbyAndDirectory = async (filter: "all" | "open" | "active" | "completed" = lobbyFilter) => {
     await fetchLobbyAndDirectorySnapshot(filter);
+  };
+
+  const refreshPostLoginState = async () => {
+    const [lobbyResult, securityResult, ratificationResult] = await Promise.allSettled([
+      refreshLobbyAndDirectory(),
+      refreshSecurityPosture(),
+      refreshRatificationState(),
+    ]);
+    if (lobbyResult.status === "rejected") {
+      throw lobbyResult.reason;
+    }
+    const nonBlockingFailures = [securityResult, ratificationResult].filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    return { partialFailures: nonBlockingFailures.length > 0 };
   };
 
   const refreshSecurityPosture = async () => {
@@ -531,21 +627,34 @@ function App() {
 
   const handleGuestLogin = () => {
     void withBusy(async () => {
-      const payload = await apiGuestLogin("Guest Player");
-      setBackendSession(payload.session);
-      setProfile(payload.profile);
-      await Promise.all([refreshLobbyAndDirectory(), refreshSecurityPosture(), refreshRatificationState()]);
-      setEventLog(`Guest session active as ${payload.profile.displayName}.`);
+      await apiGuestLogin("Guest Player");
+      setEventLog("Guest login accepted. Verifying backend session...");
+      const verifiedSession = await verifyBackendSessionAfterLogin("Guest");
+      setBackendSession(verifiedSession.session);
+      setProfile(verifiedSession.profile);
+      const refreshOutcome = await refreshPostLoginState();
+      setEventLog(
+        refreshOutcome.partialFailures
+          ? `Guest session active as ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+          : `Guest session active as ${verifiedSession.profile.displayName}.`
+      );
     });
   };
 
-  const handleDynamicLogin = (payload: { authToken: string; email?: string; displayName?: string }) => {
+  const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
     void withBusy(async () => {
-      const sessionPayload = await apiDynamicLogin(payload);
-      setBackendSession(sessionPayload.session);
-      setProfile(sessionPayload.profile);
-      await Promise.all([refreshLobbyAndDirectory(), refreshSecurityPosture(), refreshRatificationState()]);
-      setEventLog(`Dynamic session linked for ${sessionPayload.profile.displayName}.`);
+      const authToken = await waitForDynamicAuthToken();
+      await apiDynamicLogin({ authToken, ...payload });
+      setEventLog("Dynamic login accepted. Verifying backend session...");
+      const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic");
+      setBackendSession(verifiedSession.session);
+      setProfile(verifiedSession.profile);
+      const refreshOutcome = await refreshPostLoginState();
+      setEventLog(
+        refreshOutcome.partialFailures
+          ? `Dynamic session linked for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+          : `Dynamic session linked for ${verifiedSession.profile.displayName}.`
+      );
     });
   };
 
@@ -646,24 +755,42 @@ function App() {
         : "No encrypted vault payload detected in this browser or Dynamic metadata.",
     ];
 
-    const artifact = buildAccountExportArtifact({
+    const artifact = buildExportArtifact({
       session: accountModelSession,
+      portabilityStatus,
       appId: "ergo-games-day1",
-      appVersion: "day1-export-v1",
-      walletBinding: {
-        ergoAddress: profile?.walletAddress ?? accountModelSession.identity.ergoAddress,
-        walletStatus: profile?.walletStatus ?? null,
-      },
-      encryptedVault: exportVaultCandidate
+      appVersion: "day1-export-v2",
+      authProviders: externalAuthRef
+        ? [
+            {
+              providerId: "dynamic",
+              subjectRef: externalAuthRef,
+              metadata: {
+                email: profile?.email ?? null,
+              },
+            },
+          ]
+        : undefined,
+      encryptedWallet: exportVaultCandidate
         ? {
             format: `ergo-dynamic-vault-v${exportVaultCandidate.record.v}`,
             source: exportVaultCandidate.source,
+            encrypted: true,
             payload: exportVaultCandidate.record as Record<string, unknown>,
+            metadata: {
+              ergoAddress: exportVaultCandidate.record.ergoAddress,
+              walletStatus: profile?.walletStatus ?? null,
+            },
           }
-        : null,
+        : undefined,
       notes,
       exportedAt: now,
     });
+    const validation = validateExportArtifact(artifact);
+    if (!validation.ok) {
+      setEventLog(`Wallet backup validation failed: ${validation.errors.join(" ")}`);
+      return;
+    }
 
     downloadJsonFile(fileName, artifact);
     setLastBackupExportAt(now.toLocaleString());
@@ -1110,11 +1237,15 @@ function App() {
             onChange={(event) => setSelectedGameType(event.target.value as GameType)}
             disabled={busy || !backendSession}
           >
-            {gameTypes.map((entry) => (
-              <option key={entry.gameType} value={entry.gameType}>
-                {entry.displayName}
-              </option>
-            ))}
+            {gameTypes.length === 0 ? (
+              <option value={selectedGameType}>Loading game types...</option>
+            ) : (
+              gameTypes.map((entry) => (
+                <option key={entry.gameType} value={entry.gameType}>
+                  {entry.displayName}
+                </option>
+              ))
+            )}
           </select>
           <button type="button" disabled={busy || !backendSession} onClick={handleCreateGame}>
             Create Game

@@ -232,6 +232,151 @@ test("dynamic login links by email and creates a day1 session", async () => {
   }
 });
 
+test("dynamic login can load game types and create game", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_game_types_visibility",
+        email: "dynamic-game-types@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Game Types",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    const verifiedSession = await client.get("/api/auth/session").expect(200);
+    const postWithCsrf = withCsrf(client, verifiedSession.body.csrfToken as string, "post");
+    const gameTypes = await client.get("/api/game-types").expect(200);
+    const supportedTypes = (gameTypes.body.gameTypes as Array<{ gameType: string }>).map((entry) => entry.gameType);
+    assert.ok(supportedTypes.includes("tic_tac_toe"));
+    assert.ok(supportedTypes.includes("coin_flip_demo"));
+
+    const created = await postWithCsrf("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+    assert.equal(created.body.game.gameType, "tic_tac_toe");
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dynamic login rejects conflicts with an already-linked day1 account", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_subject_conflict",
+        email: "dynamic-conflict@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Conflict",
+      };
+    },
+  });
+  const linkedClient = request.agent(app);
+  const activeClient = request.agent(app);
+  try {
+    await registerAndLogin(linkedClient, {
+      displayName: "Linked User",
+      email: "linked-user@example.local",
+      password: "linked-user-pass-123",
+    });
+    const linkedDynamic = await linkedClient
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    assert.equal(linkedDynamic.body.authMode, "dynamic");
+
+    await registerAndLogin(activeClient, {
+      displayName: "Active User",
+      email: "active-user@example.local",
+      password: "active-user-pass-123",
+    });
+    const conflict = await activeClient
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(409);
+    assert.equal(conflict.body.error, "DYNAMIC_IDENTITY_CONFLICT");
+  } finally {
+    closeTestAgent(activeClient);
+    closeTestAgent(linkedClient);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dynamic login keeps existing day1 account authority when already signed in", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_subject_preserve_authority",
+        email: "dynamic-authority@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Authority",
+      };
+    },
+  });
+  const hostClient = request.agent(app);
+  let guestClient: request.SuperAgentTest | undefined;
+  try {
+    const host = await registerAndLogin(hostClient, {
+      displayName: "Guest Bootstrap",
+      email: "guest-bootstrap@example.local",
+      password: "guest-bootstrap-pass-123",
+    });
+    const hostPost = withCsrf(hostClient, host.csrfToken, "post");
+    const created = await hostPost("/api/game/create").send({}).expect(201);
+    const gameId = created.body.game.gameId as string;
+    assert.equal(created.body.game.playerSeats.X, host.userId);
+
+    const dynamicLogin = await hostClient
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    assert.equal(dynamicLogin.body.session.userId, host.userId);
+
+    const openLobby = await hostClient.get("/api/games?status=open").expect(200);
+    assert.ok(openLobby.body.games.some((entry: { gameId: string }) => entry.gameId === gameId));
+
+    guestClient = request.agent(app);
+    const guest = await registerAndLogin(guestClient, {
+      displayName: "Authority Guest",
+      email: "authority-guest@example.local",
+      password: "authority-guest-pass-123",
+    });
+    const guestPost = withCsrf(guestClient, guest.csrfToken, "post");
+    await guestPost(`/api/game/${gameId}/join`).send({}).expect(200);
+
+    const refreshedSession = await hostClient.get("/api/auth/session").expect(200);
+    await withCsrf(hostClient, refreshedSession.body.csrfToken as string, "post")(`/api/game/${gameId}/move`)
+      .send({ cell: 0 })
+      .expect(200);
+  } finally {
+    closeTestAgent(guestClient);
+    closeTestAgent(hostClient);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("guest login creates a local session without dynamic token", async () => {
   const { client, cleanup } = createTestContext();
   try {

@@ -244,11 +244,13 @@ const fetchJson = async <T>(
     let detail = `${response.status}`;
     try {
       const body = (await response.json()) as Record<string, unknown>;
-      detail = String(body.error ?? body.note ?? detail);
+      const errorCode = typeof body.error === "string" ? body.error : null;
+      const note = typeof body.note === "string" ? body.note : null;
+      detail = [errorCode, note].filter(Boolean).join(" - ") || detail;
     } catch {
       // no-op fallback to status code
     }
-    throw new Error(`${path} failed: ${detail}`);
+    throw new Error(`${path} failed (${response.status}): ${detail}`);
   }
 
   const payload = (await response.json()) as T & { csrfToken?: string };
