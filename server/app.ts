@@ -404,6 +404,16 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     return auth;
   };
 
+  const resolveAuthIfPresent = (req: express.Request) => {
+    store.purgeExpiredSessions();
+    const tokenResult = readSessionToken(req);
+    if (!tokenResult) return null;
+    if (tokenResult.token.length > SESSION_TOKEN_MAX_LENGTH) return null;
+    const sessionAndProfile = store.getSessionAndProfileByToken(tokenResult.token);
+    if (!sessionAndProfile) return null;
+    return { ...sessionAndProfile, sessionToken: tokenResult.token, authMethod: tokenResult.authMethod };
+  };
+
   const rejectIfBlocked = (
     req: express.Request,
     res: express.Response,
@@ -825,8 +835,27 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     const displayNameCandidate = normalizeDisplayName(
       String(req.body?.displayName ?? claims.displayName ?? "Dynamic Player")
     );
+    const currentAuth = resolveAuthIfPresent(req);
     const linked = store.getExternalIdentity("dynamic", claims.subject);
-    let userId = linked?.userId;
+    let userId = currentAuth?.session.userId ?? linked?.userId;
+    if (currentAuth?.session.userId && linked?.userId && linked.userId !== currentAuth.session.userId) {
+      logSecurityEvent(req, {
+        eventType: "AUTH_DYNAMIC_LOGIN",
+        userId: currentAuth.session.userId,
+        sessionId: currentAuth.session.sessionId,
+        outcome: "FAILURE",
+        metadata: {
+          reason: "IDENTITY_CONFLICT",
+          linkedUserId: linked.userId,
+          sessionUserId: currentAuth.session.userId,
+        },
+      });
+      res.status(409).json({
+        error: "DYNAMIC_IDENTITY_CONFLICT",
+        note: "Dynamic identity is already linked to a different Day1 account.",
+      });
+      return;
+    }
     const dynamicEmail = normalizeOptionalEmail(claims.email) ?? normalizeOptionalEmail(req.body?.email);
     if (!userId && dynamicEmail) {
       userId = store.getAccountCredentialByEmail(dynamicEmail)?.userId;
