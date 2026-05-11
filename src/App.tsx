@@ -34,6 +34,7 @@ import {
   apiGetLeaderboard,
   apiGetProfile,
   apiGetRewards,
+  apiGetCapabilities,
   apiSignOut,
   apiGetSession,
   apiMove,
@@ -305,6 +306,8 @@ function App() {
   const [dynamicSyncInProgress, setDynamicSyncInProgress] = useState(false);
   const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | null>(null);
   const lobbyRequestRef = useRef(0);
+  const walletBindingSectionRef = useRef<HTMLElement | null>(null);
+  const walletAddressInputRef = useRef<HTMLInputElement | null>(null);
 
   const gameStatus = useMemo(() => {
     if (gameStatusFromServer) return gameStatusFromServer;
@@ -1014,9 +1017,24 @@ function App() {
     }
     void withBusy(async () => {
       const payload = await apiBindWallet(walletAddress);
+      const capabilityEnvelope = await apiGetCapabilities();
       setProfile(payload.profile);
-      setEventLog(`Wallet bound as scaffold: ${payload.walletBinding.status}`);
+      setSessionCapabilities(capabilityEnvelope.capabilities);
+      setEventLog("Layer 2 unlocked: wallet linked for rewards.");
     });
+  };
+
+  const handleLayer2WalletSetup = () => {
+    if (!backendSession) {
+      setEventLog("Layer 2 requires Layer 1 login. Sign in first, then link wallet for rewards.");
+      return;
+    }
+    if (!walletAddress.trim() && profile?.walletAddress) {
+      setWalletAddress(profile.walletAddress);
+    }
+    walletBindingSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    walletAddressInputRef.current?.focus();
+    setEventLog("Layer 2 wallet setup ready: enter wallet address and click Bind Wallet.");
   };
 
   const handleExportWalletBackup = () => {
@@ -1339,6 +1357,22 @@ function App() {
               {progressiveCapabilities.layers.rewards.walletRequirement} wallet -{" "}
               {progressiveCapabilities.layers.rewards.message}
             </small>
+            {!isSignedIn ? (
+              <small className="layerActionHint">Complete Layer 1 login before wallet setup can start.</small>
+            ) : progressiveCapabilities.layers.rewards.eligible ? (
+              <small className="layerActionHint">
+                Rewards wallet linked: {profile?.walletAddress ?? "address unavailable"}.
+              </small>
+            ) : (
+              <div className="row progressiveActionRow">
+                <button type="button" disabled={busy} onClick={handleLayer2WalletSetup}>
+                  {progressiveCapabilities.layers.rewards.actionLabel ?? "Setup Wallet for Rewards"}
+                </button>
+                <small className="layerActionHint">
+                  Open wallet setup to link an address and activate Layer 2 rewards.
+                </small>
+              </div>
+            )}
           </div>
           <div className="progressiveLayer">
             <strong>Layer 3: {progressiveCapabilities.layers.wagering.title}</strong>
@@ -1636,13 +1670,14 @@ function App() {
         )}
       </section>
 
-      <section className="panel">
+      <section className="panel" ref={walletBindingSectionRef}>
         <h2>3) Wallet Binding (Optional)</h2>
         <p className="panelHint">
           Identity and wallet remain separate by design for MVP stability.
         </p>
         <div className="row">
           <input
+            ref={walletAddressInputRef}
             value={walletAddress}
             onChange={(event) => setWalletAddress(event.target.value)}
             placeholder="Wallet address (stub)"

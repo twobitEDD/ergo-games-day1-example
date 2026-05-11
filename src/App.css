@@ -69,6 +69,14 @@ h1 {
   margin-bottom: 0.35rem;
 }
 
+.progressiveActionRow {
+  margin-top: 0.25rem;
+}
+
+.layerActionHint {
+  color: var(--color-text-muted);
+}
+
 .layerStateActive {
   color: #166534;
 }
