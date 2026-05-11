@@ -308,6 +308,48 @@ test("dynamic compatibility bootstrap keeps session usable when JWT verifier is 
   }
 });
 
+test("dynamic outage keeps local registry auth and identity continuity available", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: null,
+  });
+  const client = request.agent(app);
+  try {
+    await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "unused-token" })
+      .expect(503);
+
+    const register = await client
+      .post("/api/auth/register")
+      .send({
+        displayName: "Outage Local User",
+        email: "outage-local@example.local",
+        password: "outage-pass-123",
+      })
+      .expect(201);
+    const userId = register.body.session.userId as string;
+    assert.ok(userId);
+
+    const recovered = await client.get("/api/auth/session").expect(200);
+    assert.equal(recovered.body.session.userId, userId);
+    assert.equal(recovered.body.profile.userId, userId);
+
+    const csrfPost = withCsrf(client, recovered.body.csrfToken as string, "post");
+    const created = await csrfPost("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+    assert.equal(created.body.game.createdByUserId, userId);
+
+    await client.post("/api/auth/recovery/request").send({ email: "outage-local@example.local" }).expect(202);
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic login returns session token fallback for header-auth recovery", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");

@@ -8,9 +8,10 @@ import {
 } from "@twobitedd/ergo-account-model";
 import { CELL_EMPTY, CELL_O, CELL_X, statusOf, type Board, type GameType, type GameTypeMetadata } from "@twobitedd/ergo-games-interface";
 import {
+  apiRegister,
+  apiLogin,
   apiGuestLogin,
   apiDynamicLogin,
-  apiAuthSync,
   apiBindWallet,
   apiCreateGame,
   apiCreateOnChainIntent,
@@ -251,6 +252,9 @@ function App() {
   const [rewards, setRewards] = useState<ApiRewardSnapshot | null>(null);
   const [intentId, setIntentId] = useState("");
   const [recoveryEmail, setRecoveryEmail] = useState("player@example.local");
+  const [localAuthDisplayName, setLocalAuthDisplayName] = useState("Local Player");
+  const [localAuthEmail, setLocalAuthEmail] = useState("player@example.local");
+  const [localAuthPassword, setLocalAuthPassword] = useState("localpass1234");
   const [recoveryToken, setRecoveryToken] = useState("");
   const [recoveryNewPassword, setRecoveryNewPassword] = useState("localpass1234");
   const [mfaCodeInput, setMfaCodeInput] = useState("");
@@ -274,7 +278,7 @@ function App() {
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
   const [authBlockingReason, setAuthBlockingReason] = useState<string | null>(null);
-  const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | "compatibility" | null>(null);
+  const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | null>(null);
   const lobbyRequestRef = useRef(0);
 
   const gameStatus = useMemo(() => {
@@ -330,6 +334,20 @@ function App() {
         : profile?.userId
           ? `day1:${profile.userId}`
           : null);
+  const providerLinks = useMemo(
+    () =>
+      externalAuthRef
+        ? [
+            {
+              providerId: "dynamic" as const,
+              subjectRef: externalAuthRef,
+              status: "linked" as const,
+              emailAtLink: profile?.email ?? null,
+            },
+          ]
+        : [],
+    [externalAuthRef, profile?.email]
+  );
   const accountModelSession = useMemo(() => {
     const walletSource: WalletSourceKind = profile?.walletStatus === "bound_stub" ? "nautilus-direct" : null;
     return buildAccountSession({
@@ -338,6 +356,17 @@ function App() {
       ergoAddress: profile?.walletAddress ?? null,
       accountId: profile?.userId ?? null,
       externalAuthRef,
+      providerLinks,
+      recoveryEmail: profile?.email ?? null,
+      serverRegistry: profile?.userId
+        ? {
+            authority: "server-registry",
+            registryId: "day1-registry",
+            userId: profile.userId,
+            continuityKey: profile.userId,
+            recoveryEmail: profile.email,
+          }
+        : undefined,
       dynamicUser: profile
         ? {
             id: profile.userId,
@@ -358,7 +387,7 @@ function App() {
         : null,
       nautilusApiAvailable: typeof window !== "undefined" && Boolean((window as { ergo?: unknown }).ergo),
     });
-  }, [profile, exportVaultCandidate, externalAuthRef]);
+  }, [profile, exportVaultCandidate, externalAuthRef, providerLinks]);
   const accountStateSnapshot = useMemo(
     () => ({
       accountType: accountModelSession.identity.ergoAddress ? "wallet-linked" : "identity-only",
@@ -430,15 +459,6 @@ function App() {
       throw new Error(`${guidance} (${lastError.message})`);
     }
     throw new Error(guidance);
-  };
-
-  const supportsDynamicCompatibilityFallback = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error ?? "");
-    return (
-      message.includes("DYNAMIC_AUTH_NOT_CONFIGURED") ||
-      message.includes("DYNAMIC_AUTH_TOKEN_REQUIRED") ||
-      message.includes("Dynamic auth token was unavailable")
-    );
   };
 
   const resetSessionState = useCallback((reason: string) => {
@@ -727,40 +747,62 @@ function App() {
     });
   };
 
+  const handleLocalRegister = () => {
+    void withBusy(async () => {
+      await apiRegister({
+        displayName: localAuthDisplayName.trim() || "Local Player",
+        email: localAuthEmail.trim(),
+        password: localAuthPassword,
+      });
+      setEventLog("Local registry account created. Verifying backend session...");
+      const verifiedSession = await verifyBackendSessionAfterLogin("Local register");
+      setBackendSession(verifiedSession.session);
+      setProfile(verifiedSession.profile);
+      const refreshOutcome = await refreshPostLoginState();
+      setDynamicAuthMode(null);
+      setEventLog(
+        refreshOutcome.partialFailures
+          ? `Local account session active for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+          : `Local account session active for ${verifiedSession.profile.displayName}.`
+      );
+    });
+  };
+
+  const handleLocalLogin = () => {
+    void withBusy(async () => {
+      await apiLogin({
+        email: localAuthEmail.trim(),
+        password: localAuthPassword,
+      });
+      setEventLog("Local registry login accepted. Verifying backend session...");
+      const verifiedSession = await verifyBackendSessionAfterLogin("Local login");
+      setBackendSession(verifiedSession.session);
+      setProfile(verifiedSession.profile);
+      const refreshOutcome = await refreshPostLoginState();
+      setDynamicAuthMode(null);
+      setEventLog(
+        refreshOutcome.partialFailures
+          ? `Local login session active for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+          : `Local login session active for ${verifiedSession.profile.displayName}.`
+      );
+    });
+  };
+
   const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
     void withBusy(async () => {
-      let mode: "jwt_verified" | "compatibility" = "jwt_verified";
-      try {
-        const authToken = await waitForDynamicAuthToken();
-        await apiDynamicLogin({ authToken, ...payload });
-      } catch (error) {
-        if (!supportsDynamicCompatibilityFallback(error)) {
-          throw error;
-        }
-        mode = "compatibility";
-        await apiAuthSync(payload);
-      }
+      const authToken = await waitForDynamicAuthToken();
+      await apiDynamicLogin({ authToken, ...payload });
       setAuthBlockingReason(null);
-      setDynamicAuthMode(mode);
-      setEventLog(
-        mode === "jwt_verified"
-          ? "Dynamic JWT login accepted. Verifying backend session..."
-          : "Dynamic compatibility bootstrap accepted. Verifying backend session..."
-      );
-      const verifiedSession = await verifyBackendSessionAfterLogin(
-        mode === "jwt_verified" ? "Dynamic JWT" : "Dynamic compatibility"
-      );
+      setDynamicAuthMode("jwt_verified");
+      setEventLog("Dynamic JWT login accepted. Verifying backend session...");
+      const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic JWT");
       setBackendSession(verifiedSession.session);
       setProfile(verifiedSession.profile);
       const refreshOutcome = await refreshPostLoginState();
       setEventLog(
-        mode === "jwt_verified"
-          ? refreshOutcome.partialFailures
-            ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-            : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
-          : refreshOutcome.partialFailures
-            ? `Dynamic linked via compatibility mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-            : `Dynamic linked via compatibility mode for ${verifiedSession.profile.displayName}.`
+        refreshOutcome.partialFailures
+          ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+          : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
       );
     });
   };
@@ -879,17 +921,23 @@ function App() {
       portabilityStatus,
       appId: "ergo-games-day1",
       appVersion: "day1-export-v2",
-      authProviders: externalAuthRef
-        ? [
-            {
-              providerId: "dynamic",
-              subjectRef: externalAuthRef,
-              metadata: {
-                email: profile?.email ?? null,
-              },
-            },
-          ]
-        : undefined,
+      authProviders: providerLinks.map((entry) => ({
+        providerId: entry.providerId,
+        subjectRef: entry.subjectRef,
+        metadata: {
+          status: entry.status,
+          email: profile?.email ?? null,
+        },
+      })),
+      recovery: {
+        channel: "email-service",
+        contact: profile?.email ?? null,
+        continuityGuaranteed: true,
+        notes: [
+          "Recovery can continue through Day1 server-owned account registry when Dynamic is unavailable.",
+          "Use /api/auth/recovery/request and /api/auth/recovery/reset for service continuity.",
+        ],
+      },
       encryptedWallet: exportVaultCandidate
         ? {
             format: `ergo-dynamic-vault-v${exportVaultCandidate.record.v}`,
@@ -1126,7 +1174,7 @@ function App() {
       <section className="panel">
         <h2>1) Account Access</h2>
         <p className="panelHint">
-          Dynamic.xyz is the primary sign-in path. Guest mode is available for no-setup local testing.
+          Dynamic.xyz is optional authentication. Day1 server registry is the authoritative account identity.
         </p>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
           <DynamicLoginPanel busy={busy} isSignedIn={isSignedIn} onSync={handleDynamicLogin} />
@@ -1135,8 +1183,34 @@ function App() {
           <button type="button" disabled={busy || isSignedIn} onClick={handleGuestLogin}>
             Continue as Guest
           </button>
-          <small>Legacy email/password auth endpoints stay server-compatible but are not part of Day1 setup UX.</small>
+          <small>Guest mode is for local testing only and is not used as Dynamic fallback.</small>
         </div>
+        <div className="row">
+          <input
+            value={localAuthDisplayName}
+            onChange={(event) => setLocalAuthDisplayName(event.target.value)}
+            placeholder="Display name"
+          />
+          <input
+            value={localAuthEmail}
+            onChange={(event) => setLocalAuthEmail(event.target.value)}
+            placeholder="Email"
+            type="email"
+          />
+          <input
+            value={localAuthPassword}
+            onChange={(event) => setLocalAuthPassword(event.target.value)}
+            placeholder="Password"
+            type="password"
+          />
+          <button type="button" disabled={busy || isSignedIn} onClick={handleLocalRegister}>
+            Register Local Account
+          </button>
+          <button type="button" disabled={busy || isSignedIn} onClick={handleLocalLogin}>
+            Local Login
+          </button>
+        </div>
+        <small>Dynamic unavailable? Use local login/register to keep server identity continuity.</small>
         {dynamicStatusMessage ? (
           <p className={`dynamicStatus dynamicStatus--${dynamic.availability}`}>
             {dynamicStatusMessage}
@@ -1148,7 +1222,7 @@ function App() {
         </small>
         {dynamicAuthMode ? (
           <small>
-            Dynamic link mode: {dynamicAuthMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"}
+            Dynamic link mode: JWT verified mode
           </small>
         ) : null}
         {authBlockingReason ? (
@@ -1164,9 +1238,9 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>2) Legacy Local Auth (Optional)</h2>
+        <h2>2) Email Recovery Path</h2>
         <p className="panelHint">
-          Day1 setup does not require email/password flows. These controls remain for compatibility testing only.
+          Email-based recovery is part of the Day1 continuity path when Dynamic is unavailable.
         </p>
         <details>
           <summary>Open legacy password recovery controls</summary>
