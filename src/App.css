@@ -50,6 +50,33 @@ h1 {
   color: var(--color-text-muted);
 }
 
+.progressiveOnboarding {
+  margin-bottom: 0.65rem;
+  padding: 0.6rem;
+  border: 1px solid var(--color-border-soft);
+  border-radius: 0.6rem;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.progressiveOnboarding h3 {
+  margin: 0 0 0.45rem;
+  font-size: 0.95rem;
+}
+
+.progressiveLayer {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.35rem;
+}
+
+.layerStateActive {
+  color: #166534;
+}
+
+.layerStateBlocked {
+  color: #9a3412;
+}
+
 .dynamicStatus {
   margin: 0.4rem 0 0.6rem;
   padding: 0.55rem 0.6rem;

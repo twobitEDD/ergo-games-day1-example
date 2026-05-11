@@ -2,8 +2,10 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } fro
 import {
   buildExportArtifact,
   buildAccountSession,
+  buildProgressiveAccountCapabilities,
   getPortabilityStatus,
   validateExportArtifact,
+  type ProgressiveAccountCapabilities,
   type WalletSourceKind,
 } from "@twobitedd/ergo-account-model";
 import { CELL_EMPTY, CELL_O, CELL_X, statusOf, type Board, type GameType, type GameTypeMetadata } from "@twobitedd/ergo-games-interface";
@@ -258,6 +260,7 @@ function App() {
   const [walletAddress, setWalletAddress] = useState("");
   const [backendSession, setBackendSession] = useState<ApiSession | null>(null);
   const [profile, setProfile] = useState<ApiProfile | null>(null);
+  const [sessionCapabilities, setSessionCapabilities] = useState<ProgressiveAccountCapabilities | null>(null);
   const [games, setGames] = useState<ApiGameListItem[]>([]);
   const [gameTypes, setGameTypes] = useState<GameTypeMetadata[]>([]);
   const [selectedGameType, setSelectedGameType] = useState<GameType>("tic_tac_toe");
@@ -428,6 +431,31 @@ function App() {
     () => getPortabilityStatus({ session: accountModelSession }),
     [accountModelSession]
   );
+  const progressiveCapabilities = useMemo(
+    () =>
+      sessionCapabilities ??
+      buildProgressiveAccountCapabilities({
+        sessionActive: Boolean(backendSession),
+        walletBound: profile?.walletStatus === "bound_stub" && Boolean(profile?.walletAddress?.trim()),
+        rewardsWalletRequirement: "required",
+        wageringWalletRequirement: "required",
+      }),
+    [sessionCapabilities, backendSession, profile?.walletStatus, profile?.walletAddress]
+  );
+  const mnemonicCryptoPathImplemented = false;
+  const mnemonicExportEnabled =
+    mnemonicCryptoPathImplemented && portabilityStatus.mnemonicExport.state === "supported";
+  const portabilitySummary = useMemo(
+    () => [
+      `Authority=${portabilityStatus.authority}`,
+      `RunWithoutDynamic=${portabilityStatus.canRunWithoutDynamic ? "yes" : "no"}`,
+      `EncryptedExport=${portabilityStatus.encryptedExport.state}`,
+      `MnemonicExport=${portabilityStatus.mnemonicExport.state}`,
+      `Nautilus=${portabilityStatus.nautilusLinkage?.status ?? "unlinked"}`,
+      `Recovery=${portabilityStatus.recoveryExportHandoff.recoveryChannel}`,
+    ],
+    [portabilityStatus]
+  );
 
   const withBusy = async (run: () => Promise<void>) => {
     setBusy(true);
@@ -446,6 +474,7 @@ function App() {
     const me = await apiGetProfile();
     setBackendSession(session.session);
     setProfile(me.profile);
+    setSessionCapabilities(session.capabilities);
     await Promise.all([refreshSecurityPosture(), refreshRatificationState()]);
     setEventLog(`Session verified for ${session.profile.displayName}`);
   };
@@ -486,6 +515,7 @@ function App() {
   const resetSessionState = useCallback((reason: string) => {
     setBackendSession(null);
     setProfile(null);
+    setSessionCapabilities(null);
     setGames([]);
     setGameTypes([]);
     setSelectedGameType("tic_tac_toe");
@@ -760,6 +790,7 @@ function App() {
       const verifiedSession = await verifyBackendSessionAfterLogin("Guest");
       setBackendSession(verifiedSession.session);
       setProfile(verifiedSession.profile);
+      setSessionCapabilities(verifiedSession.capabilities);
       const refreshOutcome = await refreshPostLoginState();
       setEventLog(
         refreshOutcome.partialFailures
@@ -780,6 +811,7 @@ function App() {
       const verifiedSession = await verifyBackendSessionAfterLogin("Local register");
       setBackendSession(verifiedSession.session);
       setProfile(verifiedSession.profile);
+      setSessionCapabilities(verifiedSession.capabilities);
       const refreshOutcome = await refreshPostLoginState();
       setDynamicAuthMode(null);
       setEventLog(
@@ -800,6 +832,7 @@ function App() {
       const verifiedSession = await verifyBackendSessionAfterLogin("Local login");
       setBackendSession(verifiedSession.session);
       setProfile(verifiedSession.profile);
+      setSessionCapabilities(verifiedSession.capabilities);
       const refreshOutcome = await refreshPostLoginState();
       setDynamicAuthMode(null);
       setEventLog(
@@ -868,6 +901,7 @@ function App() {
         );
         setBackendSession(verifiedSession.session);
         setProfile(verifiedSession.profile);
+        setSessionCapabilities(verifiedSession.capabilities);
         setDynamicSyncStatusMessage("Hydrating lobby and security state...");
         const refreshOutcome = await refreshPostLoginState();
         setDynamicSyncStatusMessage(
@@ -966,6 +1000,7 @@ function App() {
       const session = await apiGetSession();
       setBackendSession(session.session);
       setProfile(session.profile);
+      setSessionCapabilities(session.capabilities);
       setAuthBlockingReason(null);
       await refreshLobbyAndDirectory();
       setEventLog(`Recovered Day1 session for ${session.profile.displayName}.`);
@@ -1015,12 +1050,13 @@ function App() {
         },
       })),
       recovery: {
-        channel: "email-service",
-        contact: profile?.email ?? null,
-        continuityGuaranteed: true,
+        channel: portabilityStatus.recoveryExportHandoff.recoveryChannel,
+        contact: portabilityStatus.recoveryExportHandoff.recoveryContact ?? profile?.email ?? null,
+        continuityGuaranteed: portabilityStatus.recoveryExportHandoff.continuityGuaranteed,
         notes: [
           "Recovery can continue through Day1 server-owned account registry when Dynamic is unavailable.",
           "Use /api/auth/recovery/request and /api/auth/recovery/reset for service continuity.",
+          ...portabilityStatus.recoveryExportHandoff.notes,
         ],
       },
       encryptedWallet: exportVaultCandidate
@@ -1107,7 +1143,17 @@ function App() {
   };
 
   const handleRefreshRewards = () => {
-    if (!backendSession) return;
+    if (!backendSession) {
+      setEventLog("Start a Day1 session first, then open rewards.");
+      return;
+    }
+    const rewardsLayer = progressiveCapabilities.layers.rewards;
+    if (!rewardsLayer.eligible) {
+      setEventLog(
+        `${rewardsLayer.message}${rewardsLayer.actionLabel ? ` Action: ${rewardsLayer.actionLabel}.` : ""}`
+      );
+      return;
+    }
     void withBusy(async () => {
       const payload = await apiGetRewards();
       setRewards(payload.rewardSnapshot);
@@ -1118,6 +1164,13 @@ function App() {
   const handleCreateIntent = () => {
     if (!backendSession || !game) {
       setEventLog("Need session + game before creating intent.");
+      return;
+    }
+    const wageringLayer = progressiveCapabilities.layers.wagering;
+    if (!wageringLayer.eligible) {
+      setEventLog(
+        `${wageringLayer.message}${wageringLayer.actionLabel ? ` Action: ${wageringLayer.actionLabel}.` : ""}`
+      );
       return;
     }
     void withBusy(async () => {
@@ -1271,6 +1324,34 @@ function App() {
             onSync={handleDynamicLogin}
           />
         ) : null}
+        <div className="progressiveOnboarding">
+          <h3>Progressive onboarding</h3>
+          <div className="progressiveLayer">
+            <strong>Layer 1: {progressiveCapabilities.layers.freePlay.title}</strong>
+            <small className={progressiveCapabilities.layers.freePlay.eligible ? "layerStateActive" : "layerStateBlocked"}>
+              {progressiveCapabilities.layers.freePlay.eligible ? "Active" : "Pending"} -{" "}
+              {progressiveCapabilities.layers.freePlay.message}
+            </small>
+          </div>
+          <div className="progressiveLayer">
+            <strong>Layer 2: {progressiveCapabilities.layers.rewards.title}</strong>
+            <small className={progressiveCapabilities.layers.rewards.eligible ? "layerStateActive" : "layerStateBlocked"}>
+              {progressiveCapabilities.layers.rewards.walletRequirement} wallet -{" "}
+              {progressiveCapabilities.layers.rewards.message}
+            </small>
+          </div>
+          <div className="progressiveLayer">
+            <strong>Layer 3: {progressiveCapabilities.layers.wagering.title}</strong>
+            <small className={progressiveCapabilities.layers.wagering.eligible ? "layerStateActive" : "layerStateBlocked"}>
+              {progressiveCapabilities.layers.wagering.walletRequirement} wallet -{" "}
+              {progressiveCapabilities.layers.wagering.message}
+            </small>
+          </div>
+          <small>
+            Dynamic -&gt; Day1 Session is non-blocking: after session activation you can play free immediately, then add
+            wallet features as needed.
+          </small>
+        </div>
         <div className="row">
           <button type="button" disabled={busy || isSignedIn} onClick={handleGuestLogin}>
             Continue as Guest
@@ -1506,6 +1587,51 @@ function App() {
             <small className="backupHint">
               Last export: {lastBackupExportAt ?? "not exported in this session"}
             </small>
+            <div className="securityList">
+              <strong>Portability + Recovery Capabilities</strong>
+              <small>Identity ref: {portabilityStatus.identityRef}</small>
+              <small>
+                Server authority:{" "}
+                {portabilityStatus.serverAuthorityRef
+                  ? `${portabilityStatus.serverAuthorityRef.registryId}/${portabilityStatus.serverAuthorityRef.userId ?? "n/a"}`
+                  : "none"}
+              </small>
+              <small>
+                Provider links:{" "}
+                {portabilityStatus.providerLinks?.length
+                  ? portabilityStatus.providerLinks
+                      .map((link) => `${link.providerId}:${link.status}`)
+                      .join(", ")
+                  : "none"}
+              </small>
+              <small>Summary: {portabilitySummary.join(" | ")}</small>
+              <small>
+                Recovery continuity:{" "}
+                {portabilityStatus.recoveryExportHandoff.continuityGuaranteed ? "guaranteed" : "not guaranteed"}
+              </small>
+              <small>
+                Mnemonic/seed export:{" "}
+                {portabilityStatus.mnemonicExport.state === "supported"
+                  ? "supported by capability"
+                  : `blocked (${portabilityStatus.mnemonicExport.reason ?? "migration required"})`}
+              </small>
+              <button
+                type="button"
+                disabled={!mnemonicExportEnabled}
+                onClick={() =>
+                  setEventLog(
+                    "Mnemonic export will be enabled when cryptography path implementation is complete."
+                  )
+                }
+              >
+                Export Mnemonic (Capability-Gated)
+              </button>
+              {!mnemonicExportEnabled ? (
+                <small>
+                  Mnemonic flow remains disabled because cryptography/export implementation is pending completion.
+                </small>
+              ) : null}
+            </div>
           </>
         )}
       </section>
@@ -1729,7 +1855,7 @@ function App() {
       <section className="panel">
         <h2>8) On-Chain Intent Scaffold</h2>
         <div className="row">
-          <button type="button" disabled={busy || !backendSession} onClick={handleRefreshRewards}>
+          <button type="button" disabled={busy} onClick={handleRefreshRewards}>
             Get Rewards
           </button>
           <button type="button" disabled={busy || !game} onClick={handleCreateIntent}>
@@ -1743,6 +1869,22 @@ function App() {
           Rewards: {rewards ? `${rewards.tier} (${rewards.points} pts)` : "not loaded"} | Intent:{" "}
           {intentId || "not created"}
         </small>
+        {!progressiveCapabilities.layers.rewards.eligible ? (
+          <small>
+            {progressiveCapabilities.layers.rewards.message}
+            {progressiveCapabilities.layers.rewards.actionLabel
+              ? ` Action: ${progressiveCapabilities.layers.rewards.actionLabel}.`
+              : ""}
+          </small>
+        ) : null}
+        {!progressiveCapabilities.layers.wagering.eligible ? (
+          <small>
+            {progressiveCapabilities.layers.wagering.message}
+            {progressiveCapabilities.layers.wagering.actionLabel
+              ? ` Action: ${progressiveCapabilities.layers.wagering.actionLabel}.`
+              : ""}
+          </small>
+        ) : null}
       </section>
 
       <section className="panel">
