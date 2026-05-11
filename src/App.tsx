@@ -66,6 +66,7 @@ import {
 } from "./api";
 import { deriveCompletionFromStatus } from "./game-hydration";
 import { useDay1Dynamic } from "./day1DynamicState";
+import { waitForAuthTokenWithRetry } from "./dynamicSessionSync";
 import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
@@ -189,10 +190,20 @@ const FALLBACK_GAME_TYPES: GameTypeMetadata[] = [
 interface DynamicLoginPanelProps {
   busy: boolean;
   isSignedIn: boolean;
+  syncInProgress: boolean;
+  syncStatusMessage: string | null;
+  syncErrorMessage: string | null;
   onSync: (payload: { email?: string; displayName?: string }) => void;
 }
 
-const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps) => {
+const DynamicLoginPanel = ({
+  busy,
+  isSignedIn,
+  syncInProgress,
+  syncStatusMessage,
+  syncErrorMessage,
+  onSync,
+}: DynamicLoginPanelProps) => {
   const dynamic = useDay1Dynamic();
   const dynamicUser = dynamic.user;
   const dynamicEmail = typeof dynamicUser?.email === "string" ? dynamicUser.email : undefined;
@@ -216,7 +227,7 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
         </button>
       ) : null}
       <button type="button" disabled={busy || !authTokenReady} onClick={handleSync}>
-        Dynamic -&gt; Day1 Session
+        {syncInProgress ? "Syncing Dynamic -> Day1..." : "Dynamic -> Day1 Session"}
       </button>
       <button type="button" disabled={busy || !sdkReady || !dynamicUser} onClick={() => void dynamic.signOut()}>
         Dynamic Sign Out
@@ -224,6 +235,13 @@ const DynamicLoginPanel = ({ busy, isSignedIn, onSync }: DynamicLoginPanelProps)
       <small>
         Dynamic user: {dynamicEmail ?? "not authenticated"} | Day1 session: {isSignedIn ? "active" : "none"}
       </small>
+      {syncStatusMessage ? <small>{syncStatusMessage}</small> : null}
+      {syncErrorMessage ? <p className="dynamicStatus dynamicStatus--degraded">{syncErrorMessage}</p> : null}
+      {!authTokenReady ? (
+        <small>
+          Sign into Dynamic first, then retry Day1 session sync. If auth appears stuck, reopen Dynamic auth.
+        </small>
+      ) : null}
       {dynamic.active ? (
         <Suspense fallback={<small>Loading Dynamic UI...</small>}>
           <LazyDynamicWidget />
@@ -278,6 +296,9 @@ function App() {
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
   const [authBlockingReason, setAuthBlockingReason] = useState<string | null>(null);
+  const [dynamicSyncStatusMessage, setDynamicSyncStatusMessage] = useState<string | null>(null);
+  const [dynamicSyncErrorMessage, setDynamicSyncErrorMessage] = useState<string | null>(null);
+  const [dynamicSyncInProgress, setDynamicSyncInProgress] = useState(false);
   const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | null>(null);
   const lobbyRequestRef = useRef(0);
 
@@ -428,16 +449,16 @@ function App() {
     setEventLog(`Session verified for ${session.profile.displayName}`);
   };
 
-  const waitForDynamicAuthToken = async () => {
-    for (let attempt = 0; attempt < DYNAMIC_TOKEN_MAX_RETRIES; attempt += 1) {
-      const token = dynamic.getAuthToken()?.trim();
-      if (token) return token;
-      if (attempt < DYNAMIC_TOKEN_MAX_RETRIES - 1) {
-        await sleep(DYNAMIC_TOKEN_RETRY_DELAY_MS * (attempt + 1));
-      }
-    }
-    throw new Error("Dynamic auth token was unavailable. Re-open Dynamic auth and try again.");
-  };
+  const waitForDynamicAuthToken = async () =>
+    waitForAuthTokenWithRetry({
+      maxRetries: DYNAMIC_TOKEN_MAX_RETRIES,
+      retryDelayMs: DYNAMIC_TOKEN_RETRY_DELAY_MS,
+      getToken: dynamic.getAuthToken,
+      sleep,
+      onRetry: (attempt, maxRetries) => {
+        setDynamicSyncStatusMessage(`Waiting for Dynamic auth token (${attempt}/${maxRetries})...`);
+      },
+    });
 
   const verifyBackendSessionAfterLogin = async (authModeLabel: string) => {
     let lastError: unknown = null;
@@ -789,22 +810,57 @@ function App() {
   };
 
   const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
-    void withBusy(async () => {
-      const authToken = await waitForDynamicAuthToken();
-      await apiDynamicLogin({ authToken, ...payload });
-      setAuthBlockingReason(null);
-      setDynamicAuthMode("jwt_verified");
-      setEventLog("Dynamic JWT login accepted. Verifying backend session...");
-      const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic JWT");
-      setBackendSession(verifiedSession.session);
-      setProfile(verifiedSession.profile);
-      const refreshOutcome = await refreshPostLoginState();
-      setEventLog(
-        refreshOutcome.partialFailures
-          ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-          : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
-      );
-    });
+    if (!dynamic.enabled || !dynamic.configured) {
+      setDynamicSyncErrorMessage("Dynamic is not configured. Set Dynamic env vars and enable the module before syncing.");
+      setDynamicSyncStatusMessage(null);
+      return;
+    }
+    if (!dynamic.sdkHasLoaded || !dynamic.user) {
+      setDynamicSyncErrorMessage("Dynamic user session is not ready. Open Dynamic Auth and complete sign-in first.");
+      setDynamicSyncStatusMessage(null);
+      return;
+    }
+    setBusy(true);
+    setDynamicSyncInProgress(true);
+    setDynamicSyncErrorMessage(null);
+    setDynamicSyncStatusMessage("Starting Dynamic -> Day1 session handshake...");
+    void (async () => {
+      try {
+        if (!dynamic.getAuthToken()?.trim()) {
+          dynamic.openAuthFlow();
+        }
+        const authToken = await waitForDynamicAuthToken();
+        setDynamicSyncStatusMessage("Submitting Dynamic token to Day1 API...");
+        await apiDynamicLogin({ authToken, ...payload });
+        setAuthBlockingReason(null);
+        setDynamicAuthMode("jwt_verified");
+        setEventLog("Dynamic JWT login accepted. Verifying backend session...");
+        setDynamicSyncStatusMessage("Verifying Day1 backend session...");
+        const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic JWT");
+        setBackendSession(verifiedSession.session);
+        setProfile(verifiedSession.profile);
+        setDynamicSyncStatusMessage("Hydrating lobby and security state...");
+        const refreshOutcome = await refreshPostLoginState();
+        setDynamicSyncStatusMessage(
+          refreshOutcome.partialFailures
+            ? `Day1 session active for ${verifiedSession.profile.displayName}; background panels will continue syncing.`
+            : `Day1 session active for ${verifiedSession.profile.displayName}.`
+        );
+        setEventLog(
+          refreshOutcome.partialFailures
+            ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+            : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unexpected Dynamic login failure.";
+        setDynamicSyncErrorMessage(message);
+        setDynamicSyncStatusMessage(null);
+        setEventLog(`Dynamic -> Day1 session failed: ${message}`);
+      } finally {
+        setDynamicSyncInProgress(false);
+        setBusy(false);
+      }
+    })();
   };
 
   const handleRecoveryRequest = () => {
@@ -1177,7 +1233,14 @@ function App() {
           Dynamic.xyz is optional authentication. Day1 server registry is the authoritative account identity.
         </p>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
-          <DynamicLoginPanel busy={busy} isSignedIn={isSignedIn} onSync={handleDynamicLogin} />
+          <DynamicLoginPanel
+            busy={busy}
+            isSignedIn={isSignedIn}
+            syncInProgress={dynamicSyncInProgress}
+            syncStatusMessage={dynamicSyncStatusMessage}
+            syncErrorMessage={dynamicSyncErrorMessage}
+            onSync={handleDynamicLogin}
+          />
         ) : null}
         <div className="row">
           <button type="button" disabled={busy || isSignedIn} onClick={handleGuestLogin}>
