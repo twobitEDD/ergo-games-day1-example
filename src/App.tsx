@@ -12,6 +12,7 @@ import {
   apiLogin,
   apiGuestLogin,
   apiDynamicLogin,
+  apiAuthSync,
   apiBindWallet,
   apiCreateGame,
   apiCreateOnChainIntent,
@@ -831,12 +832,40 @@ function App() {
         }
         const authToken = await waitForDynamicAuthToken();
         setDynamicSyncStatusMessage("Submitting Dynamic token to Day1 API...");
-        await apiDynamicLogin({ authToken, ...payload });
+        let linkedMode: "jwt_verified" | "dynamic_compatibility" = "jwt_verified";
+        try {
+          await apiDynamicLogin({ authToken, ...payload });
+        } catch (dynamicLoginError) {
+          const dynamicLoginMessage =
+            dynamicLoginError instanceof Error
+              ? dynamicLoginError.message
+              : "Unexpected Dynamic login failure.";
+          const canFallbackToCompatibility =
+            dynamicLoginMessage.includes("DYNAMIC_AUTH_NOT_CONFIGURED") ||
+            dynamicLoginMessage.includes("DYNAMIC_AUTH_UNAVAILABLE");
+          if (!canFallbackToCompatibility) {
+            throw dynamicLoginError;
+          }
+          setDynamicSyncStatusMessage(
+            "Dynamic JWT mode unavailable. Falling back to compatibility bootstrap..."
+          );
+          await apiAuthSync({
+            displayName: payload.displayName,
+            email: payload.email,
+          });
+          linkedMode = "dynamic_compatibility";
+        }
         setAuthBlockingReason(null);
-        setDynamicAuthMode("jwt_verified");
-        setEventLog("Dynamic JWT login accepted. Verifying backend session...");
+        setDynamicAuthMode(linkedMode);
+        setEventLog(
+          linkedMode === "jwt_verified"
+            ? "Dynamic JWT login accepted. Verifying backend session..."
+            : "Dynamic compatibility login accepted. Verifying backend session..."
+        );
         setDynamicSyncStatusMessage("Verifying Day1 backend session...");
-        const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic JWT");
+        const verifiedSession = await verifyBackendSessionAfterLogin(
+          linkedMode === "jwt_verified" ? "Dynamic JWT" : "Dynamic compatibility"
+        );
         setBackendSession(verifiedSession.session);
         setProfile(verifiedSession.profile);
         setDynamicSyncStatusMessage("Hydrating lobby and security state...");
@@ -848,8 +877,8 @@ function App() {
         );
         setEventLog(
           refreshOutcome.partialFailures
-            ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-            : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
+            ? `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+            : `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}.`
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unexpected Dynamic login failure.";
