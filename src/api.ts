@@ -1,5 +1,10 @@
 import type {
   ApiCreateGameRequest,
+  LeaderboardEntry,
+  PlayerProfile,
+  PlayerRecentActivity,
+  PlayerRewardSnapshot,
+  SecurityMetricPoint,
   TicTacToeMoveAppliedEvent,
   TicTacToeMoveRejected,
   TicTacToeState,
@@ -7,6 +12,7 @@ import type {
   GameTypeMetadata,
   RuntimeGameStatus,
 } from "@twobitedd/ergo-games-interface";
+import type { ProgressiveAccountCapabilities } from "@twobitedd/ergo-account-model";
 
 const SESSION_HEADER = "x-day1-session-token";
 const CSRF_HEADER = "x-day1-csrf-token";
@@ -23,6 +29,12 @@ interface AuthBootstrapPayload {
   csrfToken?: string;
 }
 
+export interface ApiCapabilityEnvelope {
+  scaffold: true;
+  capabilities: ProgressiveAccountCapabilities;
+  authority: { authority: "day1-server-user-id"; userId: string };
+}
+
 export interface ApiSession {
   sessionId: string;
   userId: string;
@@ -32,15 +44,10 @@ export interface ApiSession {
   mfaVerifiedAt?: string;
 }
 
-export interface ApiProfile {
-  userId: string;
-  displayName: string;
+export interface ApiProfile extends Omit<PlayerProfile, "walletStatus"> {
   email: string;
   mfaEnabled?: boolean;
-  walletAddress?: string;
   walletStatus: "unbound" | "bound_stub";
-  gamesPlayed: number;
-  wins: number;
 }
 
 export interface ApiGame {
@@ -69,12 +76,7 @@ export interface ApiGameListItem {
   updatedAt: string;
 }
 
-export interface ApiRewardSnapshot {
-  userId: string;
-  tier: "none" | "starter" | "engaged";
-  points: number;
-  note: string;
-}
+export type ApiRewardSnapshot = PlayerRewardSnapshot;
 
 interface ApiIntent {
   intentId: string;
@@ -177,27 +179,11 @@ export interface ApiTruthStack {
   };
 }
 
-export interface ApiRecentPlayer {
-  userId: string;
-  displayName: string;
-  lastActiveAt: string;
-  gamesPlayed: number;
-  wins: number;
-}
+export type ApiRecentPlayer = PlayerRecentActivity;
 
-export interface ApiLeaderboardEntry {
-  rank: number;
-  userId: string;
-  displayName: string;
-  points: number;
-  wins: number;
-  gamesPlayed: number;
-}
+export type ApiLeaderboardEntry = LeaderboardEntry;
 
-export interface ApiSecurityMetric {
-  key: string;
-  count: number;
-}
+export type ApiSecurityMetric = SecurityMetricPoint;
 
 export type ApiGameStatus = RuntimeGameStatus;
 
@@ -411,6 +397,8 @@ export const apiGetSession = (sessionToken?: string) =>
     active: true;
     session: ApiSession;
     profile: ApiProfile;
+    capabilities: ProgressiveAccountCapabilities;
+    authority: ApiCapabilityEnvelope["authority"];
     csrfToken?: string;
     csrfHeader: string;
   }>(
@@ -418,6 +406,9 @@ export const apiGetSession = (sessionToken?: string) =>
     { method: "GET" },
     sessionToken
   );
+
+export const apiGetCapabilities = (sessionToken?: string) =>
+  fetchJson<ApiCapabilityEnvelope>("/api/me/capabilities", { method: "GET" }, sessionToken);
 
 export const apiSignOut = async (sessionToken?: string) => {
   const payload = await fetchJson<{ scaffold: true; signedOut: true; sessionId: string }>(

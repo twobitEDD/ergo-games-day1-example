@@ -1,6 +1,10 @@
 import cors from "cors";
 import express from "express";
 import {
+  buildProgressiveAccountCapabilities,
+  type ProgressiveAccountCapabilities,
+} from "@twobitedd/ergo-account-model";
+import {
   createCipheriv,
   createDecipheriv,
   createHash,
@@ -10,7 +14,10 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
-import type { ApiCreateGameRequest, GameType } from "@twobitedd/ergo-games-interface";
+import type {
+  ApiCreateGameRequest,
+  GameType,
+} from "@twobitedd/ergo-games-interface";
 import { Day1Store, type GameRecord, type RateLimitPolicy } from "./store";
 import { RatificationService } from "./ratification";
 import { ServerWalletManager } from "./server-wallet";
@@ -249,6 +256,25 @@ const describeRatificationReason = (reason: string | undefined) => {
     default:
       return reason ? "Ratification was not executed for the reported reason." : undefined;
   }
+};
+
+interface ApiCapabilityEnvelope {
+  scaffold: true;
+  capabilities: ProgressiveAccountCapabilities;
+  authority: { authority: "day1-server-user-id"; userId: string };
+}
+
+const deriveAccountCapabilities = (profile: {
+  walletStatus: string;
+  walletAddress?: string;
+}): ProgressiveAccountCapabilities => {
+  const hasWallet = profile.walletStatus !== "unbound" && Boolean(profile.walletAddress?.trim());
+  return buildProgressiveAccountCapabilities({
+    sessionActive: true,
+    walletBound: hasWallet,
+    rewardsWalletRequirement: "required",
+    wageringWalletRequirement: "required",
+  });
 };
 
 interface CreateDay1AppOptions {
@@ -575,17 +601,54 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     profile: { userId: string; displayName: string; email: string; walletStatus: string; gamesPlayed: number; wins: number; walletAddress?: string; mfaEnabled?: boolean },
     csrfToken: string,
     sessionToken: string
-  ) => ({
-    scaffold: true as const,
-    session,
-    sessionToken,
-    profile,
-    sessionHeader: SESSION_HEADER,
-    sessionCookie: SESSION_COOKIE_NAME,
-    csrfHeader: CSRF_HEADER,
-    csrfToken,
-    deviceHeader: DEVICE_HEADER,
+  ) => {
+    const capabilities = deriveAccountCapabilities(profile);
+    return {
+      scaffold: true as const,
+      session,
+      sessionToken,
+      profile,
+      capabilities,
+      authority: { authority: "day1-server-user-id" as const, userId: session.userId },
+      sessionHeader: SESSION_HEADER,
+      sessionCookie: SESSION_COOKIE_NAME,
+      csrfHeader: CSRF_HEADER,
+      csrfToken,
+      deviceHeader: DEVICE_HEADER,
+    };
+  };
+
+  const buildCapabilityEnvelope = (auth: {
+    session: { userId: string };
+    profile: { walletStatus: string; walletAddress?: string };
+  }): ApiCapabilityEnvelope => ({
+    scaffold: true,
+    capabilities: deriveAccountCapabilities(auth.profile),
+    authority: { authority: "day1-server-user-id", userId: auth.session.userId },
   });
+
+  const requireCapabilityForWalletBoundAction = (
+    res: express.Response,
+    auth: { session: { userId: string }; profile: { walletStatus: string; walletAddress?: string } },
+    capability: "canReceiveRewards" | "canWager"
+  ) => {
+    const envelope = buildCapabilityEnvelope(auth);
+    const eligible =
+      capability === "canReceiveRewards"
+        ? envelope.capabilities.layers.rewards.eligible
+        : envelope.capabilities.layers.wagering.eligible;
+    if (eligible) return true;
+    res.status(403).json({
+      error: "CAPABILITY_REQUIRED",
+      capability,
+      ...envelope,
+      note:
+        capability === "canReceiveRewards"
+          ? "Bind a wallet to receive rewards."
+          : "Bind a wallet before creating wager/on-chain intents.",
+    });
+    return false;
+  };
 
   const createGuestSessionPayload = (
     req: express.Request,
@@ -972,14 +1035,23 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     const auth = requireAuth(req, res);
     if (!auth) return;
     const csrfToken = store.rotateCsrfToken(auth.session.sessionId);
+    const capabilityEnvelope = buildCapabilityEnvelope(auth);
     res.json({
       scaffold: true,
       active: true,
       session: auth.session,
       profile: auth.profile,
+      capabilities: capabilityEnvelope.capabilities,
+      authority: capabilityEnvelope.authority,
       csrfToken,
       csrfHeader: CSRF_HEADER,
     });
+  });
+
+  app.get("/api/me/capabilities", (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    res.json(buildCapabilityEnvelope(auth));
   });
 
   app.post("/api/auth/csrf", (req, res) => {
@@ -1411,6 +1483,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   app.get("/api/rewards/get", (req, res) => {
     const auth = requireAuth(req, res);
     if (!auth) return;
+    if (!requireCapabilityForWalletBoundAction(res, auth, "canReceiveRewards")) return;
     const rewardSnapshot = store.getRewards(auth.session.userId);
     if (!rewardSnapshot) {
       res.status(404).json({ error: "PROFILE_NOT_FOUND" });
@@ -1422,6 +1495,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   app.post("/api/onchain/intent/create", (req, res) => {
     const auth = requireAuthForMutation(req, res);
     if (!auth) return;
+    if (!requireCapabilityForWalletBoundAction(res, auth, "canWager")) return;
     withIdempotency(req, res, { scope: "onchain:intent:create", principalKey: auth.session.userId }, () => {
       const gameId = String(req.body?.gameId ?? "");
       const action = req.body?.action === "SYNC_RESULT" ? "SYNC_RESULT" : "SETTLE_GAME";

@@ -7,10 +7,12 @@
     "node": ">=20.19.0"
   },
   "scripts": {
+    "sync:games-interface": "node -e \"const { existsSync } = require('node:fs'); const { execSync } = require('node:child_process'); if (existsSync('../ergo-games-interface/packages/domain/package.json')) { execSync('npm --prefix ../ergo-games-interface/packages/domain run build', { stdio: 'inherit' }); } else { console.log('Skipping local games-interface sync; using published package.'); }\"",
     "sync:account-model": "node -e \"const { existsSync } = require('node:fs'); const { execSync } = require('node:child_process'); if (existsSync('../ergo-account-model/package.json')) { execSync('npm --prefix ../ergo-account-model run build', { stdio: 'inherit' }); } else { console.log('Skipping local account-model sync; using published package.'); }\"",
-    "predev": "npm run sync:account-model",
-    "prebuild": "npm run sync:account-model",
-    "pretest": "npm run sync:account-model",
+    "sync:shared-contracts": "npm run sync:games-interface && npm run sync:account-model",
+    "predev": "npm run sync:shared-contracts",
+    "prebuild": "npm run sync:shared-contracts",
+    "pretest": "npm run sync:shared-contracts",
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
@@ -26,8 +28,8 @@
   "dependencies": {
     "@dynamic-labs/ethereum": "^4.81.0",
     "@dynamic-labs/sdk-react-core": "^4.81.0",
-    "@twobitedd/ergo-account-model": "^0.4.0",
-    "@twobitedd/ergo-games-interface": "^0.1.1",
+    "@twobitedd/ergo-account-model": "^0.4.1",
+    "@twobitedd/ergo-games-interface": "file:../ergo-games-interface/packages/domain",
     "better-sqlite3": "^12.9.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",

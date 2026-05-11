@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import request from "supertest";
+import { GAME_TYPES, statusOf } from "@twobitedd/ergo-games-interface";
 import { createDay1App } from "./app";
 import { Day1Store } from "./store";
 
@@ -301,6 +302,131 @@ test("dynamic compatibility bootstrap keeps session usable when JWT verifier is 
 
     const csrfToken = (verifiedSession.body.csrfToken as string) || (compatibility.body.csrfToken as string);
     await withCsrf(client, csrfToken, "post")("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dynamic session game-types response stays aligned with shared GameType contract", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "valid-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_contract_game_types",
+        email: "dynamic-contract-game-types@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Contract Coverage",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "valid-dynamic-token" })
+      .expect(200);
+    const response = await client.get("/api/game-types").expect(200);
+    const ids = (response.body.gameTypes as Array<{ gameType: string }>).map((entry) => entry.gameType).sort();
+    assert.deepEqual(ids, [...GAME_TYPES].sort());
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dynamic create/join/move responses stay aligned with shared RuntimeGameStatus contract", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token === "token-host") {
+        return {
+          subject: "dyn_contract_status_host",
+          email: "dynamic-contract-host@example.local",
+          emailVerified: true,
+          displayName: "Dynamic Status Host",
+        };
+      }
+      if (token === "token-guest") {
+        return {
+          subject: "dyn_contract_status_guest",
+          email: "dynamic-contract-guest@example.local",
+          emailVerified: true,
+          displayName: "Dynamic Status Guest",
+        };
+      }
+      throw new Error("bad token");
+    },
+  });
+  const hostClient = request.agent(app);
+  const guestClient = request.agent(app);
+  try {
+    await hostClient.post("/api/auth/dynamic/login").send({ authToken: "token-host" }).expect(200);
+    await guestClient.post("/api/auth/dynamic/login").send({ authToken: "token-guest" }).expect(200);
+    const hostSession = await hostClient.get("/api/auth/session").expect(200);
+    const guestSession = await guestClient.get("/api/auth/session").expect(200);
+    const hostPost = withCsrf(hostClient, hostSession.body.csrfToken as string, "post");
+    const guestPost = withCsrf(guestClient, guestSession.body.csrfToken as string, "post");
+
+    const created = await hostPost("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+    const gameId = created.body.game.gameId as string;
+    await guestPost(`/api/game/${gameId}/join`).send({}).expect(200);
+    await hostPost(`/api/game/${gameId}/move`).send({ cell: 0 }).expect(200);
+
+    const hydrated = await hostClient.get(`/api/game/${gameId}`).expect(200);
+    const state = hydrated.body.game.state as { board: [number, number, number, number, number, number, number, number, number]; open: boolean };
+    const sharedStatus = statusOf(state.board, state.open);
+    assert.deepEqual(hydrated.body.status, sharedStatus);
+  } finally {
+    closeTestAgent(guestClient);
+    closeTestAgent(hostClient);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wallet binding updates wallet-state contract and keeps no-wager rewards path usable", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "wallet-contract-token") throw new Error("bad token");
+      return {
+        subject: "dyn_wallet_contract",
+        email: "dynamic-wallet-contract@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Wallet Contract",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "wallet-contract-token" })
+      .expect(200);
+    const session = await client.get("/api/auth/session").expect(200);
+    assert.equal(session.body.profile.walletStatus, "unbound");
+
+    await withCsrf(client, session.body.csrfToken as string, "post")("/api/wallet/bind")
+      .send({ walletAddress: "9hContractWalletAddressStub" })
+      .expect(200);
+    const boundSession = await client.get("/api/auth/session").expect(200);
+    assert.equal(boundSession.body.profile.walletStatus, "bound_stub");
+
+    // Day1 is intentionally no-wager: rewards endpoint remains available regardless of wallet state.
+    await client.get("/api/rewards/get").expect(200);
   } finally {
     closeTestAgent(client);
     store.close();
@@ -634,6 +760,38 @@ test("guest login creates a local session without dynamic token", async () => {
   }
 });
 
+test("session capability contract reflects wallet-bound policy", async () => {
+  const { client, cleanup } = createTestContext();
+  try {
+    const identity = await registerAndLogin(client, {
+      displayName: "Capability Matrix",
+      email: "capability@example.local",
+      password: "capability-pass-123",
+    });
+    const sessionBeforeWallet = await client.get("/api/auth/session").expect(200);
+    assert.equal(sessionBeforeWallet.body.capabilities.schema, "ergo-progressive-capabilities");
+    assert.equal(sessionBeforeWallet.body.capabilities.sessionActive, true);
+    assert.equal(sessionBeforeWallet.body.capabilities.layers.freePlay.eligible, true);
+    assert.equal(sessionBeforeWallet.body.capabilities.layers.rewards.walletRequirement, "required");
+    assert.equal(sessionBeforeWallet.body.capabilities.layers.rewards.eligible, false);
+    assert.equal(sessionBeforeWallet.body.capabilities.layers.wagering.eligible, false);
+    assert.deepEqual(sessionBeforeWallet.body.authority, {
+      authority: "day1-server-user-id",
+      userId: identity.userId,
+    });
+
+    await withCsrf(client, sessionBeforeWallet.body.csrfToken as string, "post")("/api/wallet/bind")
+      .send({ walletAddress: "9fWalletCapStub" })
+      .expect(200);
+    const sessionAfterWallet = await client.get("/api/auth/session").expect(200);
+    assert.equal(sessionAfterWallet.body.capabilities.walletBound, true);
+    assert.equal(sessionAfterWallet.body.capabilities.layers.rewards.eligible, true);
+    assert.equal(sessionAfterWallet.body.capabilities.layers.wagering.eligible, true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("login endpoint applies brute-force throttle scaffold", async () => {
   const { client, cleanup } = createTestContext();
   try {
@@ -845,6 +1003,8 @@ test("turn ownership and leaderboard progression remain enforced", async () => {
     assert.ok(winnerRow.points > loserRow.points);
     assert.equal(winnerRow.rank, 1);
 
+    await aPost("/api/wallet/bind").send({ walletAddress: "9fWalletPlayerAStub" }).expect(200);
+    await bPost("/api/wallet/bind").send({ walletAddress: "9fWalletPlayerBStub" }).expect(200);
     const rewardsA = await aClient.get("/api/rewards/get").expect(200);
     const rewardsB = await bClient.get("/api/rewards/get").expect(200);
     assert.equal(rewardsA.body.rewardSnapshot.tier, "starter");
@@ -855,6 +1015,39 @@ test("turn ownership and leaderboard progression remain enforced", async () => {
   } finally {
     closeTestAgent(bClient);
     closeTestAgent(spectatorClient);
+    cleanup();
+  }
+});
+
+test("wallet-bound capabilities gate rewards and on-chain intents", async () => {
+  const { client, cleanup } = createTestContext();
+  try {
+    const identity = await registerAndLogin(client, {
+      displayName: "Wallet Capability Gate",
+      email: "wallet-capability@example.local",
+      password: "wallet-capability-pass-123",
+    });
+    const postWithCsrf = withCsrf(client, identity.csrfToken, "post");
+    const gameCreated = await postWithCsrf("/api/game/create").send({}).expect(201);
+
+    const rewardsBlocked = await client.get("/api/rewards/get").expect(403);
+    assert.equal(rewardsBlocked.body.error, "CAPABILITY_REQUIRED");
+    assert.equal(rewardsBlocked.body.capability, "canReceiveRewards");
+    assert.equal(rewardsBlocked.body.capabilities.layers.rewards.eligible, false);
+    assert.equal(rewardsBlocked.body.capabilities.layers.rewards.actionLabel, "Bind Wallet");
+
+    const intentBlocked = await postWithCsrf("/api/onchain/intent/create")
+      .send({ gameId: gameCreated.body.game.gameId, action: "SETTLE_GAME" })
+      .expect(403);
+    assert.equal(intentBlocked.body.error, "CAPABILITY_REQUIRED");
+    assert.equal(intentBlocked.body.capability, "canWager");
+
+    await postWithCsrf("/api/wallet/bind").send({ walletAddress: "9fWalletGateStub" }).expect(200);
+    await client.get("/api/rewards/get").expect(200);
+    await postWithCsrf("/api/onchain/intent/create")
+      .send({ gameId: gameCreated.body.game.gameId, action: "SETTLE_GAME" })
+      .expect(201);
+  } finally {
     cleanup();
   }
 });
@@ -1030,6 +1223,7 @@ test("truth stack endpoint classifies pending, ratified, and on-chain source rec
     assert.equal(beforeRatification.body.truth.layers.ratified.count, 0);
     assert.ok(beforeRatification.body.truth.layers.off_chain_pending.count >= 1);
 
+    await hostPost("/api/wallet/bind").send({ walletAddress: "9fWalletTruthHostStub" }).expect(200);
     await hostPost("/api/onchain/intent/create").send({ gameId, action: "SETTLE_GAME" }).expect(201);
     const withOnChainSource = await hostClient.get("/api/truth-stack?limit=50&recent=10").expect(200);
     assert.ok(withOnChainSource.body.truth.layers.on_chain_source.count >= 1);
