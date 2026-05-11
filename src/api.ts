@@ -388,7 +388,7 @@ export const apiGuestLogin = (displayName = "Guest Player") =>
     body: JSON.stringify({ displayName }),
   });
 
-export const apiAuthSync = (displayName: string) =>
+export const apiAuthSync = (payload: { displayName?: string; email?: string }) =>
   fetchJson<{
     scaffold: true;
     session: ApiSession;
@@ -399,9 +399,10 @@ export const apiAuthSync = (displayName: string) =>
     csrfHeader: string;
     csrfToken: string;
     deviceHeader: string;
+    authMode: "dynamic_compatibility";
   }>("/api/auth/sync", {
     method: "POST",
-    body: JSON.stringify({ displayName }),
+    body: JSON.stringify(payload),
   });
 
 export const apiGetSession = (sessionToken?: string) =>

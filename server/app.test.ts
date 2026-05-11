@@ -270,6 +270,44 @@ test("dynamic login can load game types and create game", async () => {
   }
 });
 
+test("dynamic compatibility bootstrap keeps session usable when JWT verifier is absent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: null,
+  });
+  const client = request.agent(app);
+  try {
+    await client
+      .post("/api/auth/dynamic/login")
+      .send({ authToken: "unused-token" })
+      .expect(503);
+
+    const compatibility = await client
+      .post("/api/auth/sync")
+      .send({
+        displayName: "Dynamic Compatibility",
+        email: "dynamic-compatibility@example.local",
+      })
+      .expect(201);
+    assert.equal(compatibility.body.authMode, "dynamic_compatibility");
+
+    const verifiedSession = await client.get("/api/auth/session").expect(200);
+    const gameTypes = await client.get("/api/game-types").expect(200);
+    const supportedTypes = (gameTypes.body.gameTypes as Array<{ gameType: string }>).map((entry) => entry.gameType);
+    assert.ok(supportedTypes.includes("tic_tac_toe"));
+
+    const csrfToken = (verifiedSession.body.csrfToken as string) || (compatibility.body.csrfToken as string);
+    await withCsrf(client, csrfToken, "post")("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic login returns session token fallback for header-auth recovery", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");

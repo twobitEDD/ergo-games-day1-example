@@ -10,6 +10,7 @@ import { CELL_EMPTY, CELL_O, CELL_X, statusOf, type Board, type GameType, type G
 import {
   apiGuestLogin,
   apiDynamicLogin,
+  apiAuthSync,
   apiBindWallet,
   apiCreateGame,
   apiCreateOnChainIntent,
@@ -273,6 +274,7 @@ function App() {
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
   const [authBlockingReason, setAuthBlockingReason] = useState<string | null>(null);
+  const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | "compatibility" | null>(null);
   const lobbyRequestRef = useRef(0);
 
   const gameStatus = useMemo(() => {
@@ -430,6 +432,15 @@ function App() {
     throw new Error(guidance);
   };
 
+  const supportsDynamicCompatibilityFallback = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    return (
+      message.includes("DYNAMIC_AUTH_NOT_CONFIGURED") ||
+      message.includes("DYNAMIC_AUTH_TOKEN_REQUIRED") ||
+      message.includes("Dynamic auth token was unavailable")
+    );
+  };
+
   const resetSessionState = useCallback((reason: string) => {
     setBackendSession(null);
     setProfile(null);
@@ -459,6 +470,7 @@ function App() {
     setRatificationIntervalMs("20000");
     setSignedBatchId("");
     setSignedTxHex("");
+    setDynamicAuthMode(null);
     setAuthBlockingReason(null);
     setEventLog(reason);
   }, []);
@@ -717,18 +729,38 @@ function App() {
 
   const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
     void withBusy(async () => {
-      const authToken = await waitForDynamicAuthToken();
-      await apiDynamicLogin({ authToken, ...payload });
+      let mode: "jwt_verified" | "compatibility" = "jwt_verified";
+      try {
+        const authToken = await waitForDynamicAuthToken();
+        await apiDynamicLogin({ authToken, ...payload });
+      } catch (error) {
+        if (!supportsDynamicCompatibilityFallback(error)) {
+          throw error;
+        }
+        mode = "compatibility";
+        await apiAuthSync(payload);
+      }
       setAuthBlockingReason(null);
-      setEventLog("Dynamic login accepted. Verifying backend session...");
-      const verifiedSession = await verifyBackendSessionAfterLogin("Dynamic");
+      setDynamicAuthMode(mode);
+      setEventLog(
+        mode === "jwt_verified"
+          ? "Dynamic JWT login accepted. Verifying backend session..."
+          : "Dynamic compatibility bootstrap accepted. Verifying backend session..."
+      );
+      const verifiedSession = await verifyBackendSessionAfterLogin(
+        mode === "jwt_verified" ? "Dynamic JWT" : "Dynamic compatibility"
+      );
       setBackendSession(verifiedSession.session);
       setProfile(verifiedSession.profile);
       const refreshOutcome = await refreshPostLoginState();
       setEventLog(
-        refreshOutcome.partialFailures
-          ? `Dynamic session linked for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-          : `Dynamic session linked for ${verifiedSession.profile.displayName}.`
+        mode === "jwt_verified"
+          ? refreshOutcome.partialFailures
+            ? `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+            : `Dynamic linked via JWT verified mode for ${verifiedSession.profile.displayName}.`
+          : refreshOutcome.partialFailures
+            ? `Dynamic linked via compatibility mode for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+            : `Dynamic linked via compatibility mode for ${verifiedSession.profile.displayName}.`
       );
     });
   };
@@ -1114,6 +1146,11 @@ function App() {
           Auth state: {isSignedIn ? "signed in" : "not signed in"} | Session ID:{" "}
           {backendSession?.sessionId ?? "none"}
         </small>
+        {dynamicAuthMode ? (
+          <small>
+            Dynamic link mode: {dynamicAuthMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"}
+          </small>
+        ) : null}
         {authBlockingReason ? (
           <p className="dynamicStatus dynamicStatus--degraded">
             {authBlockingReason} Action: click Dynamic -&gt; Day1 Session, then Recover Session + Lobby.

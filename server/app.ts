@@ -591,17 +591,23 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     req: express.Request,
     res: express.Response,
     displayNameRaw: string,
-    authMode: "guest" | "sync_bootstrap"
+    authMode: "guest" | "sync_bootstrap" | "dynamic_compatibility",
+    emailHintRaw?: string
   ) => {
     const displayName = normalizeDisplayName(displayNameRaw) || "Guest Player";
-    const email = `guest-${randomUUID().slice(0, 10)}@local.day1`;
-    const passwordSalt = randomUUID().replaceAll("-", "");
-    const profile = store.createAccount({
-      email,
-      displayName,
-      passwordSalt,
-      passwordHash: hashPassword(randomUUID().replaceAll("-", ""), passwordSalt),
-    });
+    const emailHint = normalizeEmail(String(emailHintRaw ?? ""));
+    const hintedAccount = emailHint && emailHint.includes("@") ? store.getAccountCredentialByEmail(emailHint) : null;
+    let profile = hintedAccount ? store.getProfile(hintedAccount.userId) : null;
+    if (!profile) {
+      const email = emailHint && emailHint.includes("@") ? emailHint : `guest-${randomUUID().slice(0, 10)}@local.day1`;
+      const passwordSalt = randomUUID().replaceAll("-", "");
+      profile = store.createAccount({
+        email,
+        displayName,
+        passwordSalt,
+        passwordHash: hashPassword(randomUUID().replaceAll("-", ""), passwordSalt),
+      });
+    }
     if (!profile) {
       res.status(500).json({ error: "GUEST_BOOTSTRAP_FAILED" });
       return null;
@@ -613,7 +619,12 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     });
     writeSessionCookie(res, sessionToken);
     logSecurityEvent(req, {
-      eventType: authMode === "guest" ? "AUTH_GUEST_LOGIN" : "AUTH_SYNC",
+      eventType:
+        authMode === "guest"
+          ? "AUTH_GUEST_LOGIN"
+          : authMode === "dynamic_compatibility"
+            ? "AUTH_DYNAMIC_COMPAT"
+            : "AUTH_SYNC",
       userId: profile.userId,
       sessionId: session.sessionId,
       outcome: "SUCCESS",
@@ -950,7 +961,8 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       req,
       res,
       String(req.body?.displayName ?? "Guest Player"),
-      "sync_bootstrap"
+      "dynamic_compatibility",
+      String(req.body?.email ?? "")
     );
     if (!payload) return;
     res.status(201).json(payload);
