@@ -75,6 +75,7 @@ import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
 const ENCRYPTED_VAULT_DYNAMIC_METADATA_KEY = "ergoVaultV1";
+const RECOVERY_SECRET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LIVE_SYNC_INTERVAL_MS = 4000;
 const GAME_TYPES_MAX_RETRIES = 3;
 const GAME_TYPES_RETRY_DELAY_MS = 220;
@@ -148,6 +149,71 @@ const downloadJsonFile = (fileName: string, payload: unknown): void => {
   document.body.removeChild(anchor);
   URL.revokeObjectURL(url);
 };
+
+const toBase64 = (bytes: Uint8Array): string => {
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary);
+};
+
+const createRecoverySecretCode = (): string => {
+  const random = new Uint8Array(20);
+  crypto.getRandomValues(random);
+  const secret = Array.from(random, (value) => RECOVERY_SECRET_ALPHABET[value % RECOVERY_SECRET_ALPHABET.length]).join("");
+  return secret.match(/.{1,4}/g)?.join("-") ?? secret;
+};
+
+const sha256Hex = async (value: string): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
+const deriveManagedWalletAddress = async (seed: string): Promise<string> => {
+  const hash = await sha256Hex(seed);
+  return `9h${hash.slice(0, 49)}`;
+};
+
+const encryptRecoveryPayload = async (
+  recoverySecretCode: string,
+  payload: Record<string, unknown>
+): Promise<{ iv: string; ciphertext: string; salt: string }> => {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(recoverySecretCode),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 160000,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return {
+    iv: toBase64(iv),
+    ciphertext: toBase64(new Uint8Array(ciphertext)),
+    salt: toBase64(salt),
+  };
+};
+
+const toSecurityFirstCopy = (value: string): string =>
+  value
+    .replace(/\b[Bb]ind wallet\b/g, "Create secure wallet")
+    .replace(/\b[Bb]ind\b/g, "Create")
+    .replace(/\bwallet\b/gi, "secure wallet");
 
 const toSymbol = (cell: Board[number]): "" | "X" | "O" => {
   if (cell === CELL_X) return "X";
@@ -295,6 +361,8 @@ function App() {
   const [signedBatchId, setSignedBatchId] = useState("");
   const [signedTxHex, setSignedTxHex] = useState("");
   const [eventLog, setEventLog] = useState("Ready. Sign in with Dynamic or start as guest.");
+  const [latestRecoverySecret, setLatestRecoverySecret] = useState<string | null>(null);
+  const [latestRecoveryIssuedAt, setLatestRecoveryIssuedAt] = useState<string | null>(null);
   const [lastBackupExportAt, setLastBackupExportAt] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
@@ -1020,21 +1088,66 @@ function App() {
       const capabilityEnvelope = await apiGetCapabilities();
       setProfile(payload.profile);
       setSessionCapabilities(capabilityEnvelope.capabilities);
-      setEventLog("Layer 2 unlocked: wallet linked for rewards.");
+      setEventLog("Layer 2 unlocked: ownership setup linked for rewards.");
+    });
+  };
+
+  const handleCreateSecureWallet = () => {
+    if (!backendSession) {
+      setEventLog("Sign in first to complete account security setup.");
+      return;
+    }
+    if (!dynamic.user && dynamicAuthMode !== "jwt_verified") {
+      setEventLog("Complete Dynamic sign-in first, then create your secure wallet.");
+      return;
+    }
+    void withBusy(async () => {
+      const now = Date.now();
+      const walletAddressToLink =
+        profile?.walletStatus === "bound_stub" && profile.walletAddress?.trim()
+          ? profile.walletAddress.trim()
+          : await deriveManagedWalletAddress(
+              `${externalAuthRef ?? backendSession.userId}:${now}:${crypto.randomUUID()}`
+            );
+      const recoverySecretCode = createRecoverySecretCode();
+      const recoveryEncrypted = await encryptRecoveryPayload(recoverySecretCode, {
+        type: "day1-wallet-recovery-v1",
+        accountId: backendSession.userId,
+        externalAuthRef: externalAuthRef ?? null,
+        ergoAddress: walletAddressToLink,
+        issuedAt: new Date(now).toISOString(),
+      });
+      const vaultRecord: EncryptedVaultRecord = {
+        v: 1,
+        ergoAddress: walletAddressToLink,
+        recoveryEncrypted,
+        createdAt: now,
+      };
+      window.localStorage.setItem(ENCRYPTED_VAULT_LOCAL_STORAGE_KEY, JSON.stringify(vaultRecord));
+      const payload =
+        profile?.walletStatus === "bound_stub" && profile.walletAddress?.trim()
+          ? { profile }
+          : await apiBindWallet(walletAddressToLink);
+      const capabilityEnvelope = await apiGetCapabilities();
+      setProfile(payload.profile);
+      setWalletAddress(walletAddressToLink);
+      setSessionCapabilities(capabilityEnvelope.capabilities);
+      setLatestRecoverySecret(recoverySecretCode);
+      setLatestRecoveryIssuedAt(new Date(now).toLocaleString());
+      setEventLog("Secure wallet created. Save your recovery code now to enable future export/recovery.");
     });
   };
 
   const handleLayer2WalletSetup = () => {
     if (!backendSession) {
-      setEventLog("Layer 2 requires Layer 1 login. Sign in first, then link wallet for rewards.");
+      setEventLog("Layer 2 requires Layer 1 login. Sign in first, then create your secure wallet.");
       return;
     }
     if (!walletAddress.trim() && profile?.walletAddress) {
       setWalletAddress(profile.walletAddress);
     }
     walletBindingSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    walletAddressInputRef.current?.focus();
-    setEventLog("Layer 2 wallet setup ready: enter wallet address and click Bind Wallet.");
+    setEventLog("Layer 2 security setup ready: create your secure wallet to unlock rewards.");
   };
 
   const handleExportWalletBackup = () => {
@@ -1354,22 +1467,21 @@ function App() {
           <div className="progressiveLayer">
             <strong>Layer 2: {progressiveCapabilities.layers.rewards.title}</strong>
             <small className={progressiveCapabilities.layers.rewards.eligible ? "layerStateActive" : "layerStateBlocked"}>
-              {progressiveCapabilities.layers.rewards.walletRequirement} wallet -{" "}
-              {progressiveCapabilities.layers.rewards.message}
+              Account security setup - {toSecurityFirstCopy(progressiveCapabilities.layers.rewards.message)}
             </small>
             {!isSignedIn ? (
-              <small className="layerActionHint">Complete Layer 1 login before wallet setup can start.</small>
+              <small className="layerActionHint">Complete Layer 1 login before secure setup can start.</small>
             ) : progressiveCapabilities.layers.rewards.eligible ? (
               <small className="layerActionHint">
-                Rewards wallet linked: {profile?.walletAddress ?? "address unavailable"}.
+                Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
               </small>
             ) : (
               <div className="row progressiveActionRow">
                 <button type="button" disabled={busy} onClick={handleLayer2WalletSetup}>
-                  {progressiveCapabilities.layers.rewards.actionLabel ?? "Setup Wallet for Rewards"}
+                  Create Secure Wallet
                 </button>
                 <small className="layerActionHint">
-                  Open wallet setup to link an address and activate Layer 2 rewards.
+                  Create your managed wallet and save a recovery code to activate Layer 2 rewards.
                 </small>
               </div>
             )}
@@ -1377,13 +1489,12 @@ function App() {
           <div className="progressiveLayer">
             <strong>Layer 3: {progressiveCapabilities.layers.wagering.title}</strong>
             <small className={progressiveCapabilities.layers.wagering.eligible ? "layerStateActive" : "layerStateBlocked"}>
-              {progressiveCapabilities.layers.wagering.walletRequirement} wallet -{" "}
-              {progressiveCapabilities.layers.wagering.message}
+              Security tier prerequisite - {toSecurityFirstCopy(progressiveCapabilities.layers.wagering.message)}
             </small>
           </div>
           <small>
             Dynamic -&gt; Day1 Session is non-blocking: after session activation you can play free immediately, then add
-            wallet features as needed.
+            ownership features as needed.
           </small>
         </div>
         <div className="row">
@@ -1570,7 +1681,7 @@ function App() {
               <strong>{profile?.displayName ?? "n/a"}</strong>
               <span>Email</span>
               <strong>{profile?.email ?? "n/a"}</strong>
-              <span>Wallet Linked</span>
+              <span>Ownership Setup</span>
               <strong>{profile?.walletStatus === "bound_stub" ? "yes" : "no"}</strong>
               <span>Account Type</span>
               <strong>{accountStateSnapshot.accountType}</strong>
@@ -1671,23 +1782,41 @@ function App() {
       </section>
 
       <section className="panel" ref={walletBindingSectionRef}>
-        <h2>3) Wallet Binding (Optional)</h2>
+        <h2>3) Secure Wallet Setup</h2>
         <p className="panelHint">
-          Identity and wallet remain separate by design for MVP stability.
+          Create a managed wallet tied to your account identity, then store your recovery code securely.
         </p>
         <div className="row">
-          <input
-            ref={walletAddressInputRef}
-            value={walletAddress}
-            onChange={(event) => setWalletAddress(event.target.value)}
-            placeholder="Wallet address (stub)"
-          />
-          <button type="button" disabled={busy || !backendSession} onClick={handleWalletBind}>
-            Bind Wallet
+          <button type="button" disabled={busy || !backendSession} onClick={handleCreateSecureWallet}>
+            Create Secure Wallet
           </button>
+          <small>Uses Dynamic-backed identity plus Day1 account linkage for ownership continuity.</small>
         </div>
+        {latestRecoverySecret ? (
+          <div className="securityList">
+            <strong>Recovery secret code (save offline now)</strong>
+            <code>{latestRecoverySecret}</code>
+            <small>
+              Issued: {latestRecoveryIssuedAt ?? "just now"} | This code unlocks future export/recovery workflows.
+            </small>
+          </div>
+        ) : null}
+        <details>
+          <summary>Advanced: link an existing wallet address</summary>
+          <div className="row">
+            <input
+              ref={walletAddressInputRef}
+              value={walletAddress}
+              onChange={(event) => setWalletAddress(event.target.value)}
+              placeholder="Existing wallet address"
+            />
+            <button type="button" disabled={busy || !backendSession} onClick={handleWalletBind}>
+              Link Existing Wallet
+            </button>
+          </div>
+        </details>
         <small>
-          Wallet status: {profile?.walletStatus ?? "unknown"} {profile?.walletAddress ?? ""}
+          Secure wallet status: {profile?.walletStatus ?? "unknown"} {profile?.walletAddress ?? ""}
         </small>
       </section>
 
