@@ -98,6 +98,12 @@ const resolvePlayerSymbol = (
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
 const normalizeDisplayName = (displayName: string) => displayName.trim().slice(0, 40);
+const normalizeExternalAuthRef = (value: unknown) => {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 191);
+};
 const hashPassword = (password: string, salt: string) =>
   scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
 const normalizeDeviceId = (value: string | string[] | undefined) => {
@@ -655,12 +661,22 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     res: express.Response,
     displayNameRaw: string,
     authMode: "guest" | "sync_bootstrap" | "dynamic_compatibility",
-    emailHintRaw?: string
+    emailHintRaw?: string,
+    externalAuthRefRaw?: string
   ) => {
     const displayName = normalizeDisplayName(displayNameRaw) || "Guest Player";
     const emailHint = normalizeEmail(String(emailHintRaw ?? ""));
+    const normalizedExternalAuthRef = normalizeExternalAuthRef(externalAuthRefRaw);
+    const compatibilityIdentity =
+      authMode === "dynamic_compatibility" && normalizedExternalAuthRef
+        ? store.getExternalIdentity("dynamic_compatibility", normalizedExternalAuthRef)
+        : null;
     const hintedAccount = emailHint && emailHint.includes("@") ? store.getAccountCredentialByEmail(emailHint) : null;
-    let profile = hintedAccount ? store.getProfile(hintedAccount.userId) : null;
+    let profile = compatibilityIdentity
+      ? store.getProfile(compatibilityIdentity.userId)
+      : hintedAccount
+        ? store.getProfile(hintedAccount.userId)
+        : null;
     if (!profile) {
       const email = emailHint && emailHint.includes("@") ? emailHint : `guest-${randomUUID().slice(0, 10)}@local.day1`;
       const passwordSalt = randomUUID().replaceAll("-", "");
@@ -674,6 +690,15 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     if (!profile) {
       res.status(500).json({ error: "GUEST_BOOTSTRAP_FAILED" });
       return null;
+    }
+    if (authMode === "dynamic_compatibility" && normalizedExternalAuthRef) {
+      store.upsertExternalIdentity({
+        provider: "dynamic_compatibility",
+        subject: normalizedExternalAuthRef,
+        userId: profile.userId,
+        emailAtLink: emailHint && emailHint.includes("@") ? emailHint : undefined,
+        displayNameAtLink: displayName || undefined,
+      });
     }
     const { session, sessionToken, csrfToken } = store.createSessionForUser(profile.userId, {
       ipAddress: req.ip,
@@ -1025,7 +1050,8 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       res,
       String(req.body?.displayName ?? "Guest Player"),
       "dynamic_compatibility",
-      String(req.body?.email ?? "")
+      String(req.body?.email ?? ""),
+      String(req.body?.externalAuthRef ?? "")
     );
     if (!payload) return;
     res.status(201).json(payload);

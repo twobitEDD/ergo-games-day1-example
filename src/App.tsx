@@ -647,6 +647,20 @@ function App() {
   const refreshAccountSecurityState = async () => {
     const payload = await apiGetAccountSecurityState();
     setAccountSecurityState(payload.securityState);
+    const persistedWalletAddress = payload.securityState.wallet.address?.trim();
+    if (payload.securityState.wallet.linked && persistedWalletAddress) {
+      setWalletAddress(persistedWalletAddress);
+      setProfile((previous) =>
+        previous
+          ? {
+              ...previous,
+              walletStatus: "bound_stub",
+              walletAddress: persistedWalletAddress,
+            }
+          : previous
+      );
+    }
+    return payload.securityState;
   };
 
   const refreshProfile = async () => {
@@ -1068,6 +1082,10 @@ function App() {
           await apiAuthSync({
             displayName: payload.displayName,
             email: payload.email,
+            externalAuthRef:
+              (typeof dynamic.user?.userId === "string" && dynamic.user.userId.trim()) ||
+              (typeof dynamic.user?.email === "string" && dynamic.user.email.trim()) ||
+              payload.email,
           });
           linkedMode = "dynamic_compatibility";
         }
@@ -1340,9 +1358,14 @@ function App() {
     setIsSecureWalletModalOpen(false);
     void withBusy(async () => {
       const now = Date.now();
+      const latestSecurityState = await refreshAccountSecurityState();
+      const persistedWalletAddress = latestSecurityState.wallet.address?.trim();
+      const hasPersistedLinkedWallet = Boolean(latestSecurityState.wallet.linked && persistedWalletAddress);
       const walletAddressToLink =
-        profile?.walletStatus === "bound_stub" && profile.walletAddress?.trim()
-          ? profile.walletAddress.trim()
+        hasPersistedLinkedWallet && persistedWalletAddress
+          ? persistedWalletAddress
+          : profile?.walletStatus === "bound_stub" && profile.walletAddress?.trim()
+            ? profile.walletAddress.trim()
           : await deriveManagedWalletAddress(
               `${externalAuthRef ?? backendSession.userId}:${now}:${crypto.randomUUID()}`
             );
@@ -1361,10 +1384,10 @@ function App() {
         createdAt: now,
       };
       window.localStorage.setItem(ENCRYPTED_VAULT_LOCAL_STORAGE_KEY, JSON.stringify(vaultRecord));
-      const payload =
-        profile?.walletStatus === "bound_stub" && profile.walletAddress?.trim()
-          ? { profile }
-          : await apiBindWallet(walletAddressToLink);
+      if (!hasPersistedLinkedWallet) {
+        await apiBindWallet(walletAddressToLink);
+      }
+      const refreshedProfilePayload = await apiGetProfile();
       const capabilityEnvelope = await apiGetCapabilities();
       const passkeyResult = await registerLocalPasskey(backendSession.userId, profile?.email);
       if (passkeyResult.status === "success" && passkeyResult.passkeyRecord) {
@@ -1374,7 +1397,7 @@ function App() {
         };
         window.localStorage.setItem(ENCRYPTED_VAULT_LOCAL_STORAGE_KEY, JSON.stringify(recordToPersist));
       }
-      setProfile(payload.profile);
+      setProfile(refreshedProfilePayload.profile);
       setWalletAddress(walletAddressToLink);
       setSessionCapabilities(capabilityEnvelope.capabilities);
       await refreshAccountSecurityState();

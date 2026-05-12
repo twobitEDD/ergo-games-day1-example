@@ -394,7 +394,7 @@ export const apiGuestLogin = (displayName = "Guest Player") =>
     body: JSON.stringify({ displayName }),
   });
 
-export const apiAuthSync = (payload: { displayName?: string; email?: string }) =>
+export const apiAuthSync = (payload: { displayName?: string; email?: string; externalAuthRef?: string }) =>
   fetchJson<{
     scaffold: true;
     session: ApiSession;

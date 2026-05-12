@@ -309,6 +309,55 @@ test("dynamic compatibility bootstrap keeps session usable when JWT verifier is 
   }
 });
 
+test("dynamic compatibility login preserves wallet binding across repeated sessions", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: null,
+  });
+  const client = request.agent(app);
+  try {
+    const firstCompatibility = await client
+      .post("/api/auth/sync")
+      .send({
+        displayName: "Dynamic Compatibility Stable",
+        externalAuthRef: "dyn-user-stable-001",
+      })
+      .expect(201);
+    const firstSession = await client.get("/api/auth/session").expect(200);
+    const firstUserId = firstSession.body.session.userId as string;
+    const firstCsrf = (firstSession.body.csrfToken as string) || (firstCompatibility.body.csrfToken as string);
+    await withCsrf(client, firstCsrf, "post")("/api/wallet/bind")
+      .send({ walletAddress: "9fStableCompatibilityWalletStub" })
+      .expect(200);
+    await withCsrf(client, firstCsrf, "post")("/api/auth/signout").send({}).expect(200);
+
+    await client
+      .post("/api/auth/sync")
+      .send({
+        displayName: "Dynamic Compatibility Stable",
+        externalAuthRef: "dyn-user-stable-001",
+      })
+      .expect(201);
+
+    const repeatedSession = await client.get("/api/auth/session").expect(200);
+    assert.equal(repeatedSession.body.session.userId, firstUserId);
+    assert.equal(repeatedSession.body.profile.userId, firstUserId);
+    assert.equal(repeatedSession.body.profile.walletStatus, "bound_stub");
+    assert.equal(repeatedSession.body.profile.walletAddress, "9fStableCompatibilityWalletStub");
+
+    const securityState = await client.get("/api/me/security-state").expect(200);
+    assert.equal(securityState.body.securityState.wallet.linked, true);
+    assert.equal(securityState.body.securityState.wallet.address, "9fStableCompatibilityWalletStub");
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic session game-types response stays aligned with shared GameType contract", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");
