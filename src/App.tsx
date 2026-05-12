@@ -80,6 +80,7 @@ import {
   shouldStartAutoBridgeAttempt,
   waitForAuthTokenWithRetry,
 } from "./dynamicSessionSync";
+import { deriveOnboardingProgress, type OnboardingStepAction, type OnboardingStepStatus } from "./onboardingProgress";
 import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
@@ -275,12 +276,6 @@ const decryptRecoveryPayload = async (
   return JSON.parse(new TextDecoder().decode(decrypted)) as Record<string, unknown>;
 };
 
-const toSecurityFirstCopy = (value: string): string =>
-  value
-    .replace(/\b[Bb]ind wallet\b/g, "Create secure wallet")
-    .replace(/\b[Bb]ind\b/g, "Create")
-    .replace(/\bwallet\b/gi, "secure wallet");
-
 const toSymbol = (cell: Board[number]): "" | "X" | "O" => {
   if (cell === CELL_X) return "X";
   if (cell === CELL_O) return "O";
@@ -304,6 +299,12 @@ const deriveGameTypesFailureMessage = (error: unknown) => {
   }
   const detail = error instanceof Error ? error.message : String(error ?? "Unknown request failure");
   return `Game types could not load: ${detail}`;
+};
+
+const toOnboardingStatusCopy = (status: OnboardingStepStatus) => {
+  if (status === "complete") return "Completed";
+  if (status === "in_progress") return "In progress";
+  return "Not started";
 };
 
 const FALLBACK_GAME_TYPES: GameTypeMetadata[] = [
@@ -474,6 +475,7 @@ function App() {
   const [secureWalletConfirmationChecked, setSecureWalletConfirmationChecked] = useState(false);
   const [passkeySetupState, setPasskeySetupState] = useState<PasskeySetupState>({ status: "idle", message: null });
   const [busy, setBusy] = useState(false);
+  const [activeOnboardingStepIndex, setActiveOnboardingStepIndex] = useState(0);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
@@ -485,6 +487,7 @@ function App() {
   const lobbyRequestRef = useRef(0);
   const walletBindingSectionRef = useRef<HTMLElement | null>(null);
   const walletRecoverySectionRef = useRef<HTMLElement | null>(null);
+  const lobbySectionRef = useRef<HTMLElement | null>(null);
   const walletAddressInputRef = useRef<HTMLInputElement | null>(null);
   const dynamicSyncInFlightRef = useRef<Promise<boolean> | null>(null);
   const autoBridgeAttemptsRef = useRef(0);
@@ -523,6 +526,19 @@ function App() {
           ? "Draw"
           : "Game is open";
   const isSignedIn = Boolean(backendSession);
+  const hasExampleGame = useMemo(() => {
+    const userId = backendSession?.userId;
+    if (!userId) return false;
+    if (
+      game?.gameType === "tic_tac_toe" &&
+      (game.playerSeats.X === userId || game.playerSeats.O === userId || game.participants.includes(userId))
+    ) {
+      return true;
+    }
+    return games.some(
+      (entry) => entry.gameType === "tic_tac_toe" && (entry.playerSeats.X === userId || entry.playerSeats.O === userId)
+    );
+  }, [backendSession?.userId, game, games]);
   const dynamicStatusMessage = useMemo(() => {
     if (dynamic.availability === "ready") return null;
     if (dynamic.availability === "initializing") {
@@ -654,6 +670,21 @@ function App() {
         wageringWalletRequirement: "required",
       }),
     [sessionCapabilities, backendSession, profile?.walletStatus, profile?.walletAddress]
+  );
+  const onboardingProgress = deriveOnboardingProgress({
+    hasDynamicIdentity: Boolean(dynamicIdentityKey),
+    hasBackendSession: Boolean(backendSession),
+    walletLinked: Boolean(accountSecurityState?.wallet.linked && accountSecurityState.wallet.address?.trim()),
+    walletAddress: accountSecurityState?.wallet.address?.trim() ?? profile?.walletAddress?.trim() ?? null,
+    hasRecoveryMaterial: Boolean(latestRecoverySecret?.trim() || exportVaultCandidate?.record.recoveryEncrypted?.ciphertext),
+    passkeySupported: passkeyFeatureSupported,
+    passkeyConfigured: hasLocalPasskey,
+    hasExampleGame,
+    capabilities: progressiveCapabilities,
+  });
+  const activeOnboardingStep = onboardingProgress.steps[activeOnboardingStepIndex] ?? onboardingProgress.steps[0];
+  const onboardingCompletionPercent = Math.round(
+    (onboardingProgress.completedCount / Math.max(1, onboardingProgress.totalCount)) * 100
   );
   const mnemonicCryptoPathImplemented = false;
   const mnemonicExportEnabled =
@@ -929,7 +960,7 @@ function App() {
     setTruthStack(truthPayload.truth);
   }, []);
 
-  const refreshPostLoginState = useCallback(async () => {
+  const refreshPostLoginState = async () => {
     const [lobbyResult, securityResult, ratificationResult, accountSecurityResult] = await Promise.allSettled([
       refreshLobbyAndDirectory(),
       refreshSecurityPosture(),
@@ -949,7 +980,7 @@ function App() {
       (result): result is PromiseRejectedResult => result.status === "rejected"
     );
     return { partialFailures: nonBlockingFailures.length > 0 };
-  }, [applyAuthBlockedState, refreshAccountSecurityState, refreshLobbyAndDirectory, refreshRatificationState, refreshSecurityPosture]);
+  };
 
   useEffect(() => {
     if (!backendSession) return;
@@ -1652,6 +1683,47 @@ function App() {
     });
   };
 
+  const handleOnboardingStepAction = (action: OnboardingStepAction) => {
+    if (action === "dynamic_sync") {
+      handleDynamicLogin({ email: dynamicEmail, displayName: dynamicDisplayName || undefined });
+      return;
+    }
+    if (action === "create_wallet") {
+      handleLayer2WalletSetup();
+      return;
+    }
+    if (action === "save_recovery") {
+      if (!latestRecoverySecret?.trim()) {
+        handleLayer2WalletSetup();
+        return;
+      }
+      walletBindingSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setEventLog("Save your recovery secret offline now, then continue to passkey setup.");
+      return;
+    }
+    if (action === "setup_passkey") {
+      handleSetupPasskey();
+      return;
+    }
+    if (action === "start_example_game") {
+      if (!backendSession) {
+        setEventLog("Sign in first so we can start an example game.");
+        return;
+      }
+      void withBusy(async () => {
+        setSelectedGameType("tic_tac_toe");
+        const payload = await apiCreateGame("tic_tac_toe");
+        setJoinGameId(payload.game.gameId);
+        await hydrateGameState(payload.game.gameId, `Example game ready: ${payload.game.gameId}. Make your first move.`);
+        await refreshLobbyAndDirectory();
+      });
+      return;
+    }
+    void withBusy(async () => {
+      await refreshProfile();
+    });
+  };
+
   const handleRecoverWalletFromSecret = () => {
     if (!backendSession) {
       setEventLog("Sign in first to recover wallet linkage.");
@@ -2019,9 +2091,9 @@ function App() {
       <p className="trustLabel">No-wager trusted demo flow</p>
 
       <section className="panel toolboxPanel">
-        <h2>1) Toolbox</h2>
+        <h2>1) Day 1 Onboarding</h2>
         <p className="panelHint">
-          Use these grouped actions for onboarding. Required actions are surfaced first; legacy/diagnostic paths are tucked under Advanced.
+          Follow the guided slideshow below. Each step shows one action, your current status, and what to do next.
         </p>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
           <DynamicLoginPanel
@@ -2033,165 +2105,188 @@ function App() {
             onSync={handleDynamicLogin}
           />
         ) : null}
-        <div className="progressiveOnboarding">
-          <h3>Progressive onboarding</h3>
-          <div className="progressiveLayer">
-            <strong>Layer 1: {progressiveCapabilities.layers.freePlay.title}</strong>
-            <small className={progressiveCapabilities.layers.freePlay.eligible ? "layerStateActive" : "layerStateBlocked"}>
-              {progressiveCapabilities.layers.freePlay.eligible ? "Active" : "Pending"} -{" "}
-              {progressiveCapabilities.layers.freePlay.message}
+        <div className="onboardingWizard">
+          <div className="onboardingWizardTop">
+            <h3>Day 1 setup progress</h3>
+            <small>
+              {onboardingProgress.completedCount}/{onboardingProgress.totalCount} complete ({onboardingCompletionPercent}%)
             </small>
           </div>
-          <div className="progressiveLayer">
-            <strong>Layer 2: {progressiveCapabilities.layers.rewards.title}</strong>
-            <small className={progressiveCapabilities.layers.rewards.eligible ? "layerStateActive" : "layerStateBlocked"}>
-              Account security setup - {toSecurityFirstCopy(progressiveCapabilities.layers.rewards.message)}
-            </small>
-            {!isSignedIn ? (
-              <small className="layerActionHint">Complete Layer 1 login before secure setup can start.</small>
-            ) : progressiveCapabilities.layers.rewards.eligible ? (
-              <small className="layerActionHint">
-                Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
-              </small>
-            ) : (
-              <small className="layerActionHint">
-                Create your managed wallet and save a recovery code, or recover linkage from an existing secret.
-              </small>
-            )}
+          <div className="onboardingProgressBar" aria-hidden="true">
+            <span style={{ width: `${onboardingCompletionPercent}%` }} />
           </div>
-          <div className="progressiveLayer">
-            <strong>Layer 3: {progressiveCapabilities.layers.wagering.title}</strong>
-            <small className={progressiveCapabilities.layers.wagering.eligible ? "layerStateActive" : "layerStateBlocked"}>
-              Security tier prerequisite - {toSecurityFirstCopy(progressiveCapabilities.layers.wagering.message)}
-            </small>
+          {onboardingProgress.fullyComplete ? (
+            <p className="dynamicStatus dynamicStatus--ready">
+              You are ready. Account setup is complete and your example game flow is unlocked.
+            </p>
+          ) : null}
+          {activeOnboardingStep ? (
+            <article key={activeOnboardingStep.id} className="onboardingSlideCard">
+              <div className="onboardingSlideHeader">
+                <strong>{activeOnboardingStep.title}</strong>
+                <small className={`onboardingStateBadge onboardingStateBadge--${activeOnboardingStep.status}`}>
+                  {toOnboardingStatusCopy(activeOnboardingStep.status)}
+                </small>
+              </div>
+              <p>{activeOnboardingStep.description}</p>
+              <small>{activeOnboardingStep.evidence}</small>
+              <div className="row onboardingActionRow">
+                <button type="button" disabled={busy} onClick={() => handleOnboardingStepAction(activeOnboardingStep.action)}>
+                  {activeOnboardingStep.actionLabel}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || activeOnboardingStepIndex === 0}
+                  onClick={() => setActiveOnboardingStepIndex((previous) => Math.max(0, previous - 1))}
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || activeOnboardingStepIndex >= onboardingProgress.steps.length - 1}
+                  onClick={() =>
+                    setActiveOnboardingStepIndex((previous) => Math.min(onboardingProgress.steps.length - 1, previous + 1))
+                  }
+                >
+                  Next
+                </button>
+              </div>
+            </article>
+          ) : null}
+          <div className="onboardingDots" aria-label="Onboarding step indicators">
+            {onboardingProgress.steps.map((step, index) => (
+              <button
+                key={step.id}
+                type="button"
+                className={`onboardingDot onboardingDot--${step.status}`}
+                aria-label={`Open ${step.title}`}
+                onClick={() => setActiveOnboardingStepIndex(index)}
+                disabled={busy}
+              >
+                {index + 1}
+              </button>
+            ))}
           </div>
           <small>
-            Dynamic -&gt; Day1 Session is non-blocking: after session activation you can play free immediately, then add
-            ownership features as needed.
+            This progress view uses backend session/security truth first, then local recovery/passkey evidence on this device.
           </small>
         </div>
-        <div className="toolboxGrid">
-          <div className="toolboxGroup">
-            <h3>Account Access (Required)</h3>
-            <div className="row">
-              <button
-                type="button"
-                title="Start a temporary local guest session for quick testing."
-                disabled={busy || isSignedIn}
-                onClick={handleGuestLogin}
-              >
-                Continue as Guest
-              </button>
+        <details className="toolboxAdvanced">
+          <summary>Advanced Tools</summary>
+          <div className="toolboxGrid">
+            <div className="toolboxGroup">
+              <h3>Session + Account Tools</h3>
+              <div className="row">
+                <button
+                  type="button"
+                  title="Start a temporary local guest session for quick testing."
+                  disabled={busy || isSignedIn}
+                  onClick={handleGuestLogin}
+                >
+                  Continue as Guest
+                </button>
+                <button
+                  type="button"
+                  title="Rehydrate active session context and lobby data from the backend."
+                  disabled={busy}
+                  onClick={handleRecoverSession}
+                >
+                  Recover Session + Lobby
+                </button>
+                <button
+                  type="button"
+                  title="Reload backend profile/account state and capability snapshots."
+                  disabled={busy || !backendSession}
+                  onClick={() => void withBusy(() => refreshProfile())}
+                >
+                  Refresh Backend Account
+                </button>
+                <button
+                  type="button"
+                  title="Refresh account security posture, trusted devices, and security metrics."
+                  disabled={busy || !backendSession}
+                  onClick={() => void withBusy(() => refreshSecurityPosture())}
+                >
+                  Refresh Security State
+                </button>
+              </div>
+              <div className="row">
+                <input
+                  title="Display name used for local account registration."
+                  value={localAuthDisplayName}
+                  onChange={(event) => setLocalAuthDisplayName(event.target.value)}
+                  placeholder="Display name"
+                />
+                <input
+                  title="Email for local Day1 account login/recovery."
+                  value={localAuthEmail}
+                  onChange={(event) => setLocalAuthEmail(event.target.value)}
+                  placeholder="Email"
+                  type="email"
+                />
+                <input
+                  title="Password for local Day1 account registration/login."
+                  value={localAuthPassword}
+                  onChange={(event) => setLocalAuthPassword(event.target.value)}
+                  placeholder="Password"
+                  type="password"
+                />
+                <button
+                  type="button"
+                  title="Create a local Day1 account when Dynamic is unavailable."
+                  disabled={busy || isSignedIn}
+                  onClick={handleLocalRegister}
+                >
+                  Register Local Account
+                </button>
+                <button
+                  type="button"
+                  title="Sign in with an existing local Day1 email/password account."
+                  disabled={busy || isSignedIn}
+                  onClick={handleLocalLogin}
+                >
+                  Local Login
+                </button>
+              </div>
+              <small>These tools are optional fallbacks when the guided onboarding is not enough.</small>
             </div>
-            <div className="row">
-              <input
-                title="Display name used for local account registration."
-                value={localAuthDisplayName}
-                onChange={(event) => setLocalAuthDisplayName(event.target.value)}
-                placeholder="Display name"
-              />
-              <input
-                title="Email for local Day1 account login/recovery."
-                value={localAuthEmail}
-                onChange={(event) => setLocalAuthEmail(event.target.value)}
-                placeholder="Email"
-                type="email"
-              />
-              <input
-                title="Password for local Day1 account registration/login."
-                value={localAuthPassword}
-                onChange={(event) => setLocalAuthPassword(event.target.value)}
-                placeholder="Password"
-                type="password"
-              />
-              <button
-                type="button"
-                title="Create a local Day1 account when Dynamic is unavailable."
-                disabled={busy || isSignedIn}
-                onClick={handleLocalRegister}
-              >
-                Register Local Account
-              </button>
-              <button
-                type="button"
-                title="Sign in with an existing local Day1 email/password account."
-                disabled={busy || isSignedIn}
-                onClick={handleLocalLogin}
-              >
-                Local Login
-              </button>
+            <div className="toolboxGroup">
+              <h3>Wallet + Recovery Tools</h3>
+              <div className="row">
+                <button
+                  type="button"
+                  title="Create a managed wallet and recovery secret to unlock Layer 2 rewards."
+                  disabled={busy}
+                  onClick={handleLayer2WalletSetup}
+                >
+                  Create Secure Wallet
+                </button>
+                <button
+                  type="button"
+                  title="Open wallet recovery tools to validate or restore wallet linkage from a recovery secret."
+                  disabled={busy}
+                  onClick={handleOpenRecoverWallet}
+                >
+                  Recover Wallet
+                </button>
+                <button
+                  type="button"
+                  title="Register a local device passkey (Touch ID/Face ID) after wallet setup."
+                  disabled={busy || !backendSession || !profile?.walletAddress?.trim()}
+                  onClick={handleSetupPasskey}
+                >
+                  Set Up Passkey
+                </button>
+                <button
+                  type="button"
+                  title="Download a local wallet portability backup JSON artifact."
+                  disabled={busy || !backendSession}
+                  onClick={handleExportWalletBackup}
+                >
+                  Export Wallet Backup
+                </button>
+              </div>
             </div>
-            <small>Dynamic unavailable? Use local login/register to keep server identity continuity.</small>
-          </div>
-          <div className="toolboxGroup">
-            <h3>Security / Recovery (Layer 2+)</h3>
-            <div className="row">
-              <button
-                type="button"
-                title="Create a managed wallet and recovery secret to unlock Layer 2 rewards."
-                disabled={busy}
-                onClick={handleLayer2WalletSetup}
-              >
-                Create Secure Wallet
-              </button>
-              <button
-                type="button"
-                title="Open wallet recovery tools to validate or restore wallet linkage from a recovery secret."
-                disabled={busy}
-                onClick={handleOpenRecoverWallet}
-              >
-                Recover Wallet
-              </button>
-              <button
-                type="button"
-                title="Register a local device passkey (Touch ID/Face ID) after wallet setup."
-                disabled={busy || !backendSession || !profile?.walletAddress?.trim()}
-                onClick={handleSetupPasskey}
-              >
-                Set Up Passkey
-              </button>
-            </div>
-            <small>Layer 2 requires Layer 1 login. Layer 3 remains gated by security posture readiness.</small>
-          </div>
-          <div className="toolboxGroup">
-            <h3>Wallet / Session</h3>
-            <div className="row">
-              <button
-                type="button"
-                title="Rehydrate active session context and lobby data from the backend."
-                disabled={busy}
-                onClick={handleRecoverSession}
-              >
-                Recover Session + Lobby
-              </button>
-              <button
-                type="button"
-                title="Reload backend profile/account state and capability snapshots."
-                disabled={busy || !backendSession}
-                onClick={() => void withBusy(() => refreshProfile())}
-              >
-                Refresh Backend Account
-              </button>
-              <button
-                type="button"
-                title="Refresh account security posture, trusted devices, and security metrics."
-                disabled={busy || !backendSession}
-                onClick={() => void withBusy(() => refreshSecurityPosture())}
-              >
-                Refresh Security State
-              </button>
-              <button
-                type="button"
-                title="Download a local wallet portability backup JSON artifact."
-                disabled={busy || !backendSession}
-                onClick={handleExportWalletBackup}
-              >
-                Export Wallet Backup
-              </button>
-            </div>
-          </div>
-          <details className="toolboxAdvanced">
-            <summary>Advanced / Diagnostics</summary>
             <div className="toolboxGroup">
               <h3>Legacy Email Recovery</h3>
               <div className="row">
@@ -2235,7 +2330,7 @@ function App() {
               </div>
             </div>
             <div className="toolboxGroup">
-              <h3>MFA / Device Diagnostics</h3>
+              <h3>MFA + Device Diagnostics</h3>
               <div className="row">
                 <button
                   type="button"
@@ -2313,8 +2408,8 @@ function App() {
                 </button>
               </div>
             </div>
-          </details>
-        </div>
+          </div>
+        </details>
         {dynamicStatusMessage ? (
           <p className={`dynamicStatus dynamicStatus--${dynamic.availability}`}>
             {dynamicStatusMessage}
@@ -2430,7 +2525,7 @@ function App() {
               <strong>{accountConversionSnapshot.targetType}</strong>
             </div>
             <small className="backupHint">
-              Session/account actions are grouped in the Toolbox under Wallet / Session and Advanced / Diagnostics.
+              Session and account fallback actions are available under Advanced Tools in the onboarding panel.
             </small>
             <small className="backupHint">
               Export is client-side only and never posts backup payloads to the Day1 API.{" "}
@@ -2606,7 +2701,7 @@ function App() {
         </small>
       </section>
 
-      <section className="panel">
+      <section className="panel" ref={lobbySectionRef}>
         <h2>5) Lobby (Create/Join/List)</h2>
         <div className="row">
           <select

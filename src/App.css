@@ -78,6 +78,10 @@ h1 {
   background: rgba(248, 250, 255, 0.75);
 }
 
+.toolboxAdvanced button:not(.cell) {
+  filter: saturate(0.78);
+}
+
 .toolboxAdvanced > summary {
   cursor: pointer;
   font-weight: 600;
@@ -90,6 +94,118 @@ h1 {
   border: 1px solid var(--color-border-soft);
   border-radius: 0.6rem;
   background: rgba(255, 255, 255, 0.72);
+}
+
+.onboardingWizard {
+  margin-bottom: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid var(--color-border-soft);
+  border-radius: 0.6rem;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.onboardingWizardTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.onboardingWizardTop h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.onboardingProgressBar {
+  margin: 0.45rem 0 0.55rem;
+  width: 100%;
+  height: 0.48rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-soft);
+  background: rgba(231, 235, 249, 0.8);
+  overflow: hidden;
+}
+
+.onboardingProgressBar > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #9ac5ff 0%, #77dfab 100%);
+  transition: width 240ms ease;
+}
+
+.onboardingSlideCard {
+  border: 1px solid var(--color-border-soft);
+  border-radius: 0.55rem;
+  background: rgba(250, 252, 255, 0.92);
+  padding: 0.6rem;
+  animation: onboarding-slide-in 200ms ease;
+}
+
+.onboardingSlideCard p {
+  margin: 0.35rem 0;
+}
+
+.onboardingSlideHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.onboardingStateBadge {
+  border-radius: 999px;
+  padding: 0.1rem 0.46rem;
+  font-weight: 600;
+}
+
+.onboardingStateBadge--complete {
+  color: #166534;
+  background: rgba(194, 242, 211, 0.7);
+}
+
+.onboardingStateBadge--in_progress {
+  color: #92400e;
+  background: rgba(254, 237, 192, 0.78);
+}
+
+.onboardingStateBadge--pending {
+  color: #334155;
+  background: rgba(226, 232, 240, 0.8);
+}
+
+.onboardingStateBadge--skipped {
+  color: #6d28d9;
+  background: rgba(233, 213, 255, 0.72);
+}
+
+.onboardingActionRow {
+  margin-top: 0.45rem;
+  margin-bottom: 0;
+}
+
+.onboardingDots {
+  display: flex;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+  margin-bottom: 0.45rem;
+}
+
+.onboardingDot {
+  min-width: 1.9rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+}
+
+.onboardingDot--complete {
+  border-color: #63bb8a !important;
+}
+
+.onboardingDot--in_progress {
+  border-color: #daab68 !important;
+}
+
+.onboardingDot--skipped {
+  border-color: #a78bfa !important;
 }
 
 .progressiveOnboarding h3 {
@@ -478,6 +594,17 @@ button:not(.cell):disabled {
 .secureWalletModalActions {
   justify-content: flex-end;
   margin-bottom: 0;
+}
+
+@keyframes onboarding-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
