@@ -72,7 +72,11 @@ import {
 } from "./api";
 import { deriveCompletionFromStatus } from "./game-hydration";
 import { useDay1Dynamic } from "./day1DynamicState";
-import { waitForAuthTokenWithRetry } from "./dynamicSessionSync";
+import {
+  isDynamicConfigurationError,
+  retryWithBoundedBackoff,
+  waitForAuthTokenWithRetry,
+} from "./dynamicSessionSync";
 import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
@@ -85,6 +89,13 @@ const DYNAMIC_TOKEN_MAX_RETRIES = 4;
 const DYNAMIC_TOKEN_RETRY_DELAY_MS = 180;
 const SESSION_VERIFY_MAX_RETRIES = 4;
 const SESSION_VERIFY_RETRY_DELAY_MS = 220;
+const DYNAMIC_LOGIN_MAX_ATTEMPTS = 3;
+const DYNAMIC_LOGIN_RETRY_BASE_DELAY_MS = 250;
+const DYNAMIC_LOGIN_RETRY_MAX_DELAY_MS = 1400;
+const AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY = 3;
+const AUTO_BRIDGE_COOLDOWN_BASE_MS = 4000;
+const AUTO_BRIDGE_COOLDOWN_MAX_MS = 30000;
+const AUTO_BRIDGE_SUCCESS_MESSAGE_MS = 1500;
 const LazyDynamicWidget = lazy(() =>
   import("./DynamicWidgetSlot").then((module) => ({ default: module.DynamicWidgetSlot }))
 );
@@ -331,6 +342,8 @@ type RecoveryImportState =
   | { status: "idle"; message: null }
   | { status: "success" | "warning" | "error"; message: string };
 
+type DynamicBridgeSource = "manual" | "auto";
+
 const DynamicLoginPanel = ({
   busy,
   isSignedIn,
@@ -468,6 +481,12 @@ function App() {
   const walletBindingSectionRef = useRef<HTMLElement | null>(null);
   const walletRecoverySectionRef = useRef<HTMLElement | null>(null);
   const walletAddressInputRef = useRef<HTMLInputElement | null>(null);
+  const dynamicSyncInFlightRef = useRef<Promise<boolean> | null>(null);
+  const autoBridgeAttemptsRef = useRef(0);
+  const autoBridgeCooldownUntilRef = useRef(0);
+  const autoBridgeIdentityRef = useRef<string | null>(null);
+  const autoBridgeReadyRef = useRef(false);
+  const autoBridgeStatusTimerRef = useRef<number | null>(null);
 
   const gameStatus = useMemo(() => {
     if (gameStatusFromServer) return gameStatusFromServer;
@@ -513,6 +532,18 @@ function App() {
     }
     return `${dynamic.reason ?? "Dynamic is unavailable."} Fix Dynamic dashboard origins/domains and verify env values before retrying.`;
   }, [dynamic.availability, dynamic.reason]);
+  const dynamicEmail = typeof dynamicUser?.email === "string" ? dynamicUser.email : undefined;
+  const dynamicDisplayName =
+    [typeof dynamicUser?.firstName === "string" ? dynamicUser.firstName : "", typeof dynamicUser?.lastName === "string" ? dynamicUser.lastName : ""]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || dynamicEmail;
+  const dynamicIdentityKey =
+    (typeof dynamicUser?.userId === "string" && dynamicUser.userId.trim()
+      ? `user:${dynamicUser.userId.trim()}`
+      : typeof dynamicUser?.email === "string" && dynamicUser.email.trim()
+        ? `email:${dynamicUser.email.trim().toLowerCase()}`
+        : null);
   const exportVaultCandidate = loadExportVaultCandidate(dynamicUser);
   const localPasskeyRecord =
     exportVaultCandidate?.record.passkey &&
@@ -644,7 +675,15 @@ function App() {
     }
   };
 
-  const refreshAccountSecurityState = async () => {
+  useEffect(() => {
+    return () => {
+      if (autoBridgeStatusTimerRef.current !== null) {
+        window.clearTimeout(autoBridgeStatusTimerRef.current);
+      }
+    };
+  }, []);
+
+  const refreshAccountSecurityState = useCallback(async () => {
     const payload = await apiGetAccountSecurityState();
     setAccountSecurityState(payload.securityState);
     const persistedWalletAddress = payload.securityState.wallet.address?.trim();
@@ -661,7 +700,7 @@ function App() {
       );
     }
     return payload.securityState;
-  };
+  }, []);
 
   const refreshProfile = async () => {
     const session = await apiGetSession();
@@ -673,16 +712,35 @@ function App() {
     setEventLog(`Session verified for ${session.profile.displayName}`);
   };
 
-  const waitForDynamicAuthToken = async () =>
-    waitForAuthTokenWithRetry({
-      maxRetries: DYNAMIC_TOKEN_MAX_RETRIES,
-      retryDelayMs: DYNAMIC_TOKEN_RETRY_DELAY_MS,
-      getToken: dynamic.getAuthToken,
-      sleep,
-      onRetry: (attempt, maxRetries) => {
-        setDynamicSyncStatusMessage(`Waiting for Dynamic auth token (${attempt}/${maxRetries})...`);
-      },
-    });
+  const clearAutoSyncStatusSoon = useCallback(() => {
+    if (autoBridgeStatusTimerRef.current !== null) {
+      window.clearTimeout(autoBridgeStatusTimerRef.current);
+    }
+    autoBridgeStatusTimerRef.current = window.setTimeout(() => {
+      setDynamicSyncStatusMessage((previous) =>
+        previous === "Restoring Day1 session..." || previous?.startsWith("Day1 session active for ") ? null : previous
+      );
+      autoBridgeStatusTimerRef.current = null;
+    }, AUTO_BRIDGE_SUCCESS_MESSAGE_MS);
+  }, []);
+
+  const waitForDynamicAuthToken = useCallback(
+    async (source: DynamicBridgeSource) =>
+      waitForAuthTokenWithRetry({
+        maxRetries: DYNAMIC_TOKEN_MAX_RETRIES,
+        retryDelayMs: DYNAMIC_TOKEN_RETRY_DELAY_MS,
+        getToken: dynamic.getAuthToken,
+        sleep,
+        onRetry: (attempt, maxRetries) => {
+          setDynamicSyncStatusMessage(
+            source === "auto"
+              ? "Restoring Day1 session..."
+              : `Waiting for Dynamic auth token (${attempt}/${maxRetries})...`
+          );
+        },
+      }),
+    [dynamic.getAuthToken]
+  );
 
   const verifyBackendSessionAfterLogin = async (authModeLabel: string) => {
     let lastError: unknown = null;
@@ -830,11 +888,41 @@ function App() {
     }
   }, [fetchGameTypesWithRetry]);
 
-  const refreshLobbyAndDirectory = async (filter: "all" | "open" | "active" | "completed" = lobbyFilter) => {
-    await fetchLobbyAndDirectorySnapshot(filter);
-  };
+  const refreshLobbyAndDirectory = useCallback(
+    async (filter: "all" | "open" | "active" | "completed" = lobbyFilter) => {
+      await fetchLobbyAndDirectorySnapshot(filter);
+    },
+    [fetchLobbyAndDirectorySnapshot, lobbyFilter]
+  );
 
-  const refreshPostLoginState = async () => {
+  const refreshSecurityPosture = useCallback(async () => {
+    const [devicesPayload, sessionsPayload, metricsPayload] = await Promise.all([
+      apiListTrustedDevices(),
+      apiListSessions(),
+      apiGetSecurityMetrics(),
+    ]);
+    setTrustedDevices(devicesPayload.devices.map((entry) => ({ deviceId: entry.deviceId, label: entry.label })));
+    setActiveSessions(sessionsPayload.sessions.map((entry) => ({ sessionId: entry.sessionId, deviceId: entry.deviceId })));
+    setSecurityMetrics(metricsPayload.metrics);
+  }, []);
+
+  const refreshRatificationState = useCallback(async () => {
+    const [walletPayload, schedulePayload, batchesPayload, truthPayload] = await Promise.all([
+      apiGetServerWalletStatus(),
+      apiGetRatificationSchedule(),
+      apiListRatificationBatches(20),
+      apiGetTruthStack(60, 8),
+    ]);
+    setWalletStatus(walletPayload.wallet);
+    setRatificationSchedule(schedulePayload.schedule);
+    setRatificationCheckpoint(schedulePayload.checkpoint);
+    setRatificationAdapter(schedulePayload.adapter);
+    setRatificationIntervalMs(String(schedulePayload.schedule.intervalMs));
+    setRatificationBatches(batchesPayload.batches);
+    setTruthStack(truthPayload.truth);
+  }, []);
+
+  const refreshPostLoginState = useCallback(async () => {
     const [lobbyResult, securityResult, ratificationResult, accountSecurityResult] = await Promise.allSettled([
       refreshLobbyAndDirectory(),
       refreshSecurityPosture(),
@@ -854,34 +942,7 @@ function App() {
       (result): result is PromiseRejectedResult => result.status === "rejected"
     );
     return { partialFailures: nonBlockingFailures.length > 0 };
-  };
-
-  const refreshSecurityPosture = async () => {
-    const [devicesPayload, sessionsPayload, metricsPayload] = await Promise.all([
-      apiListTrustedDevices(),
-      apiListSessions(),
-      apiGetSecurityMetrics(),
-    ]);
-    setTrustedDevices(devicesPayload.devices.map((entry) => ({ deviceId: entry.deviceId, label: entry.label })));
-    setActiveSessions(sessionsPayload.sessions.map((entry) => ({ sessionId: entry.sessionId, deviceId: entry.deviceId })));
-    setSecurityMetrics(metricsPayload.metrics);
-  };
-
-  const refreshRatificationState = async () => {
-    const [walletPayload, schedulePayload, batchesPayload, truthPayload] = await Promise.all([
-      apiGetServerWalletStatus(),
-      apiGetRatificationSchedule(),
-      apiListRatificationBatches(20),
-      apiGetTruthStack(60, 8),
-    ]);
-    setWalletStatus(walletPayload.wallet);
-    setRatificationSchedule(schedulePayload.schedule);
-    setRatificationCheckpoint(schedulePayload.checkpoint);
-    setRatificationAdapter(schedulePayload.adapter);
-    setRatificationIntervalMs(String(schedulePayload.schedule.intervalMs));
-    setRatificationBatches(batchesPayload.batches);
-    setTruthStack(truthPayload.truth);
-  };
+  }, [applyAuthBlockedState, refreshAccountSecurityState, refreshLobbyAndDirectory, refreshRatificationState, refreshSecurityPosture]);
 
   useEffect(() => {
     if (!backendSession) return;
@@ -1040,92 +1101,198 @@ function App() {
     });
   };
 
-  const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
-    if (!dynamic.enabled || !dynamic.configured) {
-      setDynamicSyncErrorMessage("Dynamic is not configured. Set Dynamic env vars and enable the module before syncing.");
-      setDynamicSyncStatusMessage(null);
-      return;
-    }
-    if (!dynamic.sdkHasLoaded || !dynamic.user) {
-      setDynamicSyncErrorMessage("Dynamic user session is not ready. Open Dynamic Auth and complete sign-in first.");
-      setDynamicSyncStatusMessage(null);
-      return;
-    }
-    setBusy(true);
-    setDynamicSyncInProgress(true);
-    setDynamicSyncErrorMessage(null);
-    setDynamicSyncStatusMessage("Starting Dynamic -> Day1 session handshake...");
-    void (async () => {
-      try {
-        if (!dynamic.getAuthToken()?.trim()) {
-          dynamic.openAuthFlow();
-        }
-        const authToken = await waitForDynamicAuthToken();
-        setDynamicSyncStatusMessage("Submitting Dynamic token to Day1 API...");
-        let linkedMode: "jwt_verified" | "dynamic_compatibility" = "jwt_verified";
-        try {
-          await apiDynamicLogin({ authToken, ...payload });
-        } catch (dynamicLoginError) {
-          const dynamicLoginMessage =
-            dynamicLoginError instanceof Error
-              ? dynamicLoginError.message
-              : "Unexpected Dynamic login failure.";
-          const canFallbackToCompatibility =
-            dynamicLoginMessage.includes("DYNAMIC_AUTH_NOT_CONFIGURED") ||
-            dynamicLoginMessage.includes("DYNAMIC_AUTH_UNAVAILABLE");
-          if (!canFallbackToCompatibility) {
-            throw dynamicLoginError;
-          }
-          setDynamicSyncStatusMessage(
-            "Dynamic JWT mode unavailable. Falling back to compatibility bootstrap..."
-          );
-          await apiAuthSync({
-            displayName: payload.displayName,
-            email: payload.email,
-            externalAuthRef:
-              (typeof dynamic.user?.userId === "string" && dynamic.user.userId.trim()) ||
-              (typeof dynamic.user?.email === "string" && dynamic.user.email.trim()) ||
-              payload.email,
-          });
-          linkedMode = "dynamic_compatibility";
-        }
-        setAuthBlockingReason(null);
-        setDynamicAuthMode(linkedMode);
-        setEventLog(
-          linkedMode === "jwt_verified"
-            ? "Dynamic JWT login accepted. Verifying backend session..."
-            : "Dynamic compatibility login accepted. Verifying backend session..."
-        );
-        setDynamicSyncStatusMessage("Verifying Day1 backend session...");
-        const verifiedSession = await verifyBackendSessionAfterLogin(
-          linkedMode === "jwt_verified" ? "Dynamic JWT" : "Dynamic compatibility"
-        );
-        setBackendSession(verifiedSession.session);
-        setProfile(verifiedSession.profile);
-        setSessionCapabilities(verifiedSession.capabilities);
-        setDynamicSyncStatusMessage("Hydrating lobby and security state...");
-        const refreshOutcome = await refreshPostLoginState();
-        setDynamicSyncStatusMessage(
-          refreshOutcome.partialFailures
-            ? `Day1 session active for ${verifiedSession.profile.displayName}; background panels will continue syncing.`
-            : `Day1 session active for ${verifiedSession.profile.displayName}.`
-        );
-        setEventLog(
-          refreshOutcome.partialFailures
-            ? `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
-            : `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}.`
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Unexpected Dynamic login failure.";
-        setDynamicSyncErrorMessage(message);
-        setDynamicSyncStatusMessage(null);
-        setEventLog(`Dynamic -> Day1 session failed: ${message}`);
-      } finally {
-        setDynamicSyncInProgress(false);
-        setBusy(false);
+  const performDynamicSessionSync = useCallback(
+    ({ payload, source }: { payload: { email?: string; displayName?: string }; source: DynamicBridgeSource }) => {
+      if (dynamicSyncInFlightRef.current) {
+        return dynamicSyncInFlightRef.current;
       }
-    })();
+      if (!dynamic.enabled || !dynamic.configured) {
+        setDynamicSyncErrorMessage("Dynamic is not configured. Set Dynamic env vars and enable the module before syncing.");
+        setDynamicSyncStatusMessage(null);
+        return Promise.resolve(false);
+      }
+      if (!dynamic.sdkHasLoaded || !dynamic.user) {
+        setDynamicSyncErrorMessage("Dynamic user session is not ready. Open Dynamic Auth and complete sign-in first.");
+        setDynamicSyncStatusMessage(null);
+        return Promise.resolve(false);
+      }
+      if (source === "manual") {
+        setBusy(true);
+      }
+      setDynamicSyncInProgress(true);
+      setDynamicSyncErrorMessage(null);
+      setDynamicSyncStatusMessage(
+        source === "auto" ? "Restoring Day1 session..." : "Starting Dynamic -> Day1 session handshake..."
+      );
+      const inFlight = (async () => {
+        try {
+          if (source === "manual" && !dynamic.getAuthToken()?.trim()) {
+            dynamic.openAuthFlow();
+          }
+          const authToken = await waitForDynamicAuthToken(source);
+          let linkedMode: "jwt_verified" | "dynamic_compatibility" = "jwt_verified";
+          await retryWithBoundedBackoff({
+            maxAttempts: DYNAMIC_LOGIN_MAX_ATTEMPTS,
+            baseDelayMs: DYNAMIC_LOGIN_RETRY_BASE_DELAY_MS,
+            maxDelayMs: DYNAMIC_LOGIN_RETRY_MAX_DELAY_MS,
+            sleep,
+            shouldRetry: (error) => !isDynamicConfigurationError(error),
+            onRetry: () => {
+              setDynamicSyncStatusMessage(
+                source === "auto"
+                  ? "Restoring Day1 session..."
+                  : "Retrying Dynamic session bridge..."
+              );
+            },
+            run: async () => {
+              setDynamicSyncStatusMessage(
+                source === "auto"
+                  ? "Restoring Day1 session..."
+                  : "Submitting Dynamic token to Day1 API..."
+              );
+              try {
+                await apiDynamicLogin({ authToken, ...payload });
+                linkedMode = "jwt_verified";
+              } catch (dynamicLoginError) {
+                if (!isDynamicConfigurationError(dynamicLoginError)) {
+                  throw dynamicLoginError;
+                }
+                setDynamicSyncStatusMessage(
+                  source === "auto"
+                    ? "Restoring Day1 session..."
+                    : "Dynamic JWT mode unavailable. Falling back to compatibility bootstrap..."
+                );
+                await apiAuthSync({
+                  displayName: payload.displayName,
+                  email: payload.email,
+                  externalAuthRef:
+                    (typeof dynamic.user?.userId === "string" && dynamic.user.userId.trim()) ||
+                    (typeof dynamic.user?.email === "string" && dynamic.user.email.trim()) ||
+                    payload.email,
+                });
+                linkedMode = "dynamic_compatibility";
+              }
+            },
+          });
+          setAuthBlockingReason(null);
+          setDynamicAuthMode(linkedMode);
+          setEventLog(
+            linkedMode === "jwt_verified"
+              ? "Dynamic JWT login accepted. Verifying backend session..."
+              : "Dynamic compatibility login accepted. Verifying backend session..."
+          );
+          setDynamicSyncStatusMessage(
+            source === "auto" ? "Restoring Day1 session..." : "Verifying Day1 backend session..."
+          );
+          const verifiedSession = await verifyBackendSessionAfterLogin(
+            linkedMode === "jwt_verified" ? "Dynamic JWT" : "Dynamic compatibility"
+          );
+          setBackendSession(verifiedSession.session);
+          setProfile(verifiedSession.profile);
+          setSessionCapabilities(verifiedSession.capabilities);
+          setDynamicSyncStatusMessage(
+            source === "auto" ? "Restoring Day1 session..." : "Hydrating lobby and security state..."
+          );
+          const refreshOutcome = await refreshPostLoginState();
+          setDynamicSyncStatusMessage(
+            refreshOutcome.partialFailures
+              ? `Day1 session active for ${verifiedSession.profile.displayName}; background panels will continue syncing.`
+              : `Day1 session active for ${verifiedSession.profile.displayName}.`
+          );
+          setEventLog(
+            refreshOutcome.partialFailures
+              ? `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}. Some non-critical panels will refresh on next sync.`
+              : `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}.`
+          );
+          if (source === "auto") {
+            clearAutoSyncStatusSoon();
+          }
+          return true;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : "Unexpected Dynamic login failure.";
+          const message =
+            source === "auto"
+              ? `Automatic Day1 session restore did not complete (${detail}). Use "Dynamic -> Day1 Session" to retry.`
+              : detail;
+          setDynamicSyncErrorMessage(message);
+          setDynamicSyncStatusMessage(null);
+          setEventLog(`Dynamic -> Day1 session failed: ${message}`);
+          return false;
+        } finally {
+          setDynamicSyncInProgress(false);
+          if (source === "manual") {
+            setBusy(false);
+          }
+          dynamicSyncInFlightRef.current = null;
+        }
+      })();
+      dynamicSyncInFlightRef.current = inFlight;
+      return inFlight;
+    },
+    [clearAutoSyncStatusSoon, dynamic, refreshPostLoginState, waitForDynamicAuthToken]
+  );
+
+  const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
+    void performDynamicSessionSync({ payload, source: "manual" });
   };
+
+  useEffect(() => {
+    const dynamicReady = dynamic.active && dynamic.sdkHasLoaded && Boolean(dynamicIdentityKey);
+    const identityChanged = autoBridgeIdentityRef.current !== dynamicIdentityKey;
+    const becameReady = dynamicReady && !autoBridgeReadyRef.current;
+    autoBridgeReadyRef.current = dynamicReady;
+    if (identityChanged) {
+      autoBridgeIdentityRef.current = dynamicIdentityKey;
+      autoBridgeAttemptsRef.current = 0;
+      autoBridgeCooldownUntilRef.current = 0;
+    }
+    if (!dynamicReady || !dynamicIdentityKey) {
+      return;
+    }
+    const shouldAttempt =
+      becameReady || identityChanged || !backendSession || Boolean(authBlockingReason) || dynamicAuthMode !== "jwt_verified";
+    if (!shouldAttempt) {
+      return;
+    }
+    if (dynamicSyncInFlightRef.current || dynamicSyncInProgress) {
+      return;
+    }
+    const now = Date.now();
+    if (now < autoBridgeCooldownUntilRef.current) {
+      return;
+    }
+    if (autoBridgeAttemptsRef.current >= AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY) {
+      return;
+    }
+    void (async () => {
+      const success = await performDynamicSessionSync({
+        source: "auto",
+        payload: { email: dynamicEmail, displayName: dynamicDisplayName || undefined },
+      });
+      if (success) {
+        autoBridgeAttemptsRef.current = 0;
+        autoBridgeCooldownUntilRef.current = 0;
+        return;
+      }
+      autoBridgeAttemptsRef.current += 1;
+      const cooldownMs = Math.min(
+        AUTO_BRIDGE_COOLDOWN_MAX_MS,
+        AUTO_BRIDGE_COOLDOWN_BASE_MS * 2 ** (autoBridgeAttemptsRef.current - 1)
+      );
+      autoBridgeCooldownUntilRef.current = Date.now() + cooldownMs;
+    })();
+  }, [
+    authBlockingReason,
+    backendSession,
+    dynamic.active,
+    dynamic.sdkHasLoaded,
+    dynamicAuthMode,
+    dynamicDisplayName,
+    dynamicEmail,
+    dynamicIdentityKey,
+    dynamicSyncInProgress,
+    performDynamicSessionSync,
+  ]);
 
   const handleRecoveryRequest = () => {
     void withBusy(async () => {
