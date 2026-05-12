@@ -5,6 +5,7 @@ import {
   buildProgressiveAccountCapabilities,
   getPortabilityStatus,
   validateExportArtifact,
+  type AccountTransferIntent,
   type ProgressiveAccountCapabilities,
   type WalletSourceKind,
 } from "@twobitedd/ergo-account-model";
@@ -80,8 +81,10 @@ import {
   shouldStartAutoBridgeAttempt,
   waitForAuthTokenWithRetry,
 } from "./dynamicSessionSync";
+import { deriveAccountProgression } from "./accountProgression";
 import { deriveOnboardingProgress, type OnboardingStepAction, type OnboardingStepStatus } from "./onboardingProgress";
 import { isDuplicatePasskeyCredentialSignal } from "./passkeyRegistration";
+import { deriveTransferIntentReadModel } from "./transferIntents";
 import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
@@ -97,6 +100,7 @@ const SESSION_VERIFY_RETRY_DELAY_MS = 220;
 const DYNAMIC_LOGIN_MAX_ATTEMPTS = 3;
 const DYNAMIC_LOGIN_RETRY_BASE_DELAY_MS = 250;
 const DYNAMIC_LOGIN_RETRY_MAX_DELAY_MS = 1400;
+const ACCOUNT_REPAIR_SYNC_INTERVAL_MS = 15000;
 // Auto-bridge guardrails: keep retries rare, bounded, and identity-scoped.
 const AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY = 3;
 const AUTO_BRIDGE_COOLDOWN_BASE_MS = 4000;
@@ -446,6 +450,7 @@ function App() {
   const [joinGameId, setJoinGameId] = useState("");
   const [rewards, setRewards] = useState<ApiRewardSnapshot | null>(null);
   const [intentId, setIntentId] = useState("");
+  const [transferIntents] = useState<AccountTransferIntent[]>([]);
   const [recoveryEmail, setRecoveryEmail] = useState("player@example.local");
   const [localAuthDisplayName, setLocalAuthDisplayName] = useState("Local Player");
   const [localAuthEmail, setLocalAuthEmail] = useState("player@example.local");
@@ -476,7 +481,6 @@ function App() {
   const [secureWalletConfirmationChecked, setSecureWalletConfirmationChecked] = useState(false);
   const [passkeySetupState, setPasskeySetupState] = useState<PasskeySetupState>({ status: "idle", message: null });
   const [busy, setBusy] = useState(false);
-  const [activeOnboardingStepIndex, setActiveOnboardingStepIndex] = useState(0);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [gameTypesLoadError, setGameTypesLoadError] = useState<string | null>(null);
@@ -683,7 +687,20 @@ function App() {
     hasExampleGame,
     capabilities: progressiveCapabilities,
   });
-  const activeOnboardingStep = onboardingProgress.steps[activeOnboardingStepIndex] ?? onboardingProgress.steps[0];
+  const accountProgression = useMemo(
+    () =>
+      deriveAccountProgression({
+        hasBackendSession: Boolean(backendSession),
+        securityState: accountSecurityState,
+      }),
+    [backendSession, accountSecurityState]
+  );
+  const easyModeStatus = onboardingProgress.fullyComplete ? "Ready" : "Needs one action";
+  const easyModePrimaryStep = onboardingProgress.steps[onboardingProgress.firstActionableIndex] ?? onboardingProgress.steps[0];
+  const transferIntentReadModel = useMemo(
+    () => deriveTransferIntentReadModel(transferIntents),
+    [transferIntents]
+  );
   const onboardingCompletionPercent = Math.round(
     (onboardingProgress.completedCount / Math.max(1, onboardingProgress.totalCount)) * 100
   );
@@ -1015,6 +1032,46 @@ function App() {
       window.clearInterval(interval);
     };
   }, [backendSession, lobbyFilter, fetchLobbyAndDirectorySnapshot, applyAuthBlockedState]);
+
+  useEffect(() => {
+    if (!backendSession) return;
+    let disposed = false;
+
+    const runBackgroundRepairs = async () => {
+      try {
+        const sessionPayload = await apiGetSession();
+        if (disposed) return;
+        setBackendSession(sessionPayload.session);
+        setSessionCapabilities(sessionPayload.capabilities);
+        await refreshAccountSecurityState();
+        if (disposed) return;
+        if (passkeyFeatureSupported && !hasLocalPasskey && passkeySetupState.status === "idle") {
+          setPasskeySetupState({
+            status: "warning",
+            message: "Passkey is available on this device. Add it when you are ready for faster sign-in.",
+          });
+        }
+      } catch {
+        // Keep this idempotent and non-blocking for active play.
+      }
+    };
+
+    void runBackgroundRepairs();
+    const interval = window.setInterval(() => {
+      void runBackgroundRepairs();
+    }, ACCOUNT_REPAIR_SYNC_INTERVAL_MS);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    backendSession,
+    refreshAccountSecurityState,
+    passkeyFeatureSupported,
+    hasLocalPasskey,
+    passkeySetupState.status,
+  ]);
 
   useEffect(() => {
     if (!backendSession || !game?.gameId) return;
@@ -1725,6 +1782,31 @@ function App() {
     });
   };
 
+  const handleEasyModeContinue = () => {
+    if (!onboardingProgress.fullyComplete && easyModePrimaryStep) {
+      handleOnboardingStepAction(easyModePrimaryStep.action);
+      return;
+    }
+    if (!backendSession) {
+      setEventLog("Connect your Day1 session first, then continue playing.");
+      return;
+    }
+    const currentUserId = backendSession.userId;
+    const currentGameIsMine =
+      game &&
+      (game.playerSeats.X === currentUserId ||
+        game.playerSeats.O === currentUserId ||
+        game.participants.includes(currentUserId))
+        ? game.gameId
+        : null;
+    const resumableGame = currentGameIsMine ?? games.find((entry) => canJoinLobbyEntry(entry))?.gameId;
+    if (resumableGame) {
+      handleJoinGame(resumableGame);
+      return;
+    }
+    handleCreateGame();
+  };
+
   const handleOnboardingStepAction = (action: OnboardingStepAction) => {
     if (action === "dynamic_sync") {
       handleDynamicLogin({ email: dynamicEmail, displayName: dynamicDisplayName || undefined });
@@ -2135,7 +2217,7 @@ function App() {
       <section className="panel toolboxPanel">
         <h2>1) Day 1 Onboarding</h2>
         <p className="panelHint">
-          Follow the guided slideshow below. Each step shows one action, your current status, and what to do next.
+          Easy mode keeps one primary action visible while background checks keep session, wallet link, and passkey hints up to date.
         </p>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
           <DynamicLoginPanel
@@ -2149,68 +2231,69 @@ function App() {
         ) : null}
         <div className="onboardingWizard">
           <div className="onboardingWizardTop">
-            <h3>Day 1 setup progress</h3>
-            <small>
-              {onboardingProgress.completedCount}/{onboardingProgress.totalCount} complete ({onboardingCompletionPercent}%)
-            </small>
+            <h3>Day 1 easy mode</h3>
+            <small>{easyModeStatus}</small>
           </div>
           <div className="onboardingProgressBar" aria-hidden="true">
             <span style={{ width: `${onboardingCompletionPercent}%` }} />
           </div>
-          {onboardingProgress.fullyComplete ? (
-            <p className="dynamicStatus dynamicStatus--ready">
-              You are ready. Account setup is complete and your example game flow is unlocked.
-            </p>
-          ) : null}
-          {activeOnboardingStep ? (
-            <article key={activeOnboardingStep.id} className="onboardingSlideCard">
-              <div className="onboardingSlideHeader">
-                <strong>{activeOnboardingStep.title}</strong>
-                <small className={`onboardingStateBadge onboardingStateBadge--${activeOnboardingStep.status}`}>
-                  {toOnboardingStatusCopy(activeOnboardingStep.status)}
-                </small>
-              </div>
-              <p>{activeOnboardingStep.description}</p>
-              <small>{activeOnboardingStep.evidence}</small>
-              <div className="row onboardingActionRow">
-                <button type="button" disabled={busy} onClick={() => handleOnboardingStepAction(activeOnboardingStep.action)}>
-                  {activeOnboardingStep.actionLabel}
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || activeOnboardingStepIndex === 0}
-                  onClick={() => setActiveOnboardingStepIndex((previous) => Math.max(0, previous - 1))}
-                >
-                  Previous
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || activeOnboardingStepIndex >= onboardingProgress.steps.length - 1}
-                  onClick={() =>
-                    setActiveOnboardingStepIndex((previous) => Math.min(onboardingProgress.steps.length - 1, previous + 1))
-                  }
-                >
-                  Next
-                </button>
-              </div>
-            </article>
-          ) : null}
-          <div className="onboardingDots" aria-label="Onboarding step indicators">
-            {onboardingProgress.steps.map((step, index) => (
-              <button
-                key={step.id}
-                type="button"
-                className={`onboardingDot onboardingDot--${step.status}`}
-                aria-label={`Open ${step.title}`}
-                onClick={() => setActiveOnboardingStepIndex(index)}
-                disabled={busy}
-              >
-                {index + 1}
-              </button>
-            ))}
+          <p className={`dynamicStatus ${onboardingProgress.fullyComplete ? "dynamicStatus--ready" : "dynamicStatus--initializing"}`}>
+            {onboardingProgress.fullyComplete
+              ? "Ready. Continue playing now."
+              : `Needs one action: ${easyModePrimaryStep?.title ?? "Complete setup"}.`}
+          </p>
+          <div className="row onboardingActionRow">
+            <button type="button" disabled={busy} onClick={handleEasyModeContinue}>
+              Continue Playing
+            </button>
           </div>
           <small>
-            This progress view uses backend session/security truth first, then local recovery/passkey evidence on this device.
+            {onboardingProgress.completedCount}/{onboardingProgress.totalCount} setup checks complete ({onboardingCompletionPercent}
+            %)
+          </small>
+          {passkeySetupState.status === "warning" && passkeySetupState.message ? (
+            <small>{passkeySetupState.message}</small>
+          ) : null}
+          <div className="row">
+            <small>Identity: {accountProgression.identityReadiness === "ready" ? "Ready" : "Needs action"}</small>
+            <small>Custody: {accountProgression.custodyReadiness === "ready" ? "Ready" : "Needs action"}</small>
+            <small>Payout: {accountProgression.payoutReadiness === "ready" ? "Ready" : "Optional setup"}</small>
+          </div>
+          {accountProgression.nextActionHint ? <small>{accountProgression.nextActionHint}</small> : null}
+          <details>
+            <summary>Show setup details</summary>
+            {onboardingProgress.steps.map((step) => (
+              <article key={step.id} className="onboardingSlideCard">
+                <div className="onboardingSlideHeader">
+                  <strong>{step.title}</strong>
+                  <small className={`onboardingStateBadge onboardingStateBadge--${step.status}`}>
+                    {toOnboardingStatusCopy(step.status)}
+                  </small>
+                </div>
+                <p>{step.description}</p>
+                <small>{step.evidence}</small>
+                <div className="row onboardingActionRow">
+                  <button type="button" disabled={busy} onClick={() => handleOnboardingStepAction(step.action)}>
+                    {step.actionLabel}
+                  </button>
+                </div>
+              </article>
+            ))}
+            <small>This view derives from backend session/security truth with local passkey/recovery hints.</small>
+          </details>
+          <details>
+            <summary>Show payout and transfer foundations</summary>
+            <small>
+              Ergo rail: {accountProgression.payoutRails.find((rail) => rail.rail === "ergo")?.state ?? "not_connected"} | PayPal
+              rail: {accountProgression.payoutRails.find((rail) => rail.rail === "paypal")?.state ?? "coming_soon"}
+            </small>
+            <small>
+              Transfer intents scaffold: {transferIntentReadModel.activeCount} active, {transferIntentReadModel.completedCount}{" "}
+              completed, {transferIntentReadModel.failedCount} failed.
+            </small>
+          </details>
+          <small>
+            This easy mode derives readiness from backend truth and keeps optional rails non-blocking.
           </small>
         </div>
         <details className="toolboxAdvanced">
