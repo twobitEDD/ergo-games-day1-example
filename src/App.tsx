@@ -81,6 +81,7 @@ import {
   waitForAuthTokenWithRetry,
 } from "./dynamicSessionSync";
 import { deriveOnboardingProgress, type OnboardingStepAction, type OnboardingStepStatus } from "./onboardingProgress";
+import { isDuplicatePasskeyCredentialSignal } from "./passkeyRegistration";
 import "./App.css";
 
 const ENCRYPTED_VAULT_LOCAL_STORAGE_KEY = "ergo-dynamic-vault-v1";
@@ -342,7 +343,7 @@ interface LocalPasskeyRecord {
 
 type PasskeySetupState =
   | { status: "idle"; message: null }
-  | { status: "success" | "unsupported" | "skipped" | "error"; message: string };
+  | { status: "success" | "already_configured" | "unsupported" | "skipped" | "error"; message: string };
 
 type RecoveryImportState =
   | { status: "idle"; message: null }
@@ -1444,7 +1445,7 @@ function App() {
     accountUserId: string,
     accountEmail?: string
   ): Promise<{
-    status: "success" | "unsupported" | "skipped" | "error";
+    status: "success" | "already_configured" | "unsupported" | "skipped" | "error";
     message: string;
     passkeyRecord?: LocalPasskeyRecord;
   }> => {
@@ -1491,6 +1492,48 @@ function App() {
           },
         ]
       : undefined;
+    const toPasskeyRecord = (credentialId: string, transports: string[]): LocalPasskeyRecord => ({
+      credentialId,
+      rpId: window.location.hostname,
+      createdAt: new Date().toISOString(),
+      transports,
+    });
+    const verifyExistingPasskey = async (): Promise<LocalPasskeyRecord | undefined> => {
+      if (!navigator.credentials?.get) {
+        if (!existingCredentialId) return undefined;
+        return toPasskeyRecord(existingCredentialId, []);
+      }
+      try {
+        const credential = (await navigator.credentials.get({
+          publicKey: {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            rpId: window.location.hostname,
+            timeout: 60000,
+            userVerification: "preferred",
+            allowCredentials: excludeCredentials,
+          },
+        })) as PublicKeyCredential | null;
+        if (!credential) {
+          if (!existingCredentialId) return undefined;
+          return toPasskeyRecord(existingCredentialId, []);
+        }
+        const attachment = typeof credential.authenticatorAttachment === "string" ? credential.authenticatorAttachment : null;
+        const transports = attachment ? [attachment] : [];
+        return toPasskeyRecord(toBase64Url(new Uint8Array(credential.rawId)), transports);
+      } catch {
+        if (!existingCredentialId) return undefined;
+        return toPasskeyRecord(existingCredentialId, []);
+      }
+    };
+
+    if (existingCredentialId) {
+      const verifiedRecord = await verifyExistingPasskey();
+      return {
+        status: "already_configured",
+        message: "Passkey protection is already configured on this device.",
+        passkeyRecord: verifiedRecord,
+      };
+    }
 
     try {
       const createdCredential = (await navigator.credentials.create({
@@ -1536,12 +1579,7 @@ function App() {
       return {
         status: "success",
         message: "Secure wallet created and local passkey registered on this device.",
-        passkeyRecord: {
-          credentialId: toBase64Url(new Uint8Array(createdCredential.rawId)),
-          rpId: window.location.hostname,
-          createdAt: new Date().toISOString(),
-          transports,
-        },
+        passkeyRecord: toPasskeyRecord(toBase64Url(new Uint8Array(createdCredential.rawId)), transports),
       };
     } catch (error) {
       if (error instanceof DOMException && error.name === "NotAllowedError") {
@@ -1549,6 +1587,14 @@ function App() {
           status: "skipped",
           message:
             "Wallet created. Passkey setup was skipped or canceled; you can add one later from a passkey-capable device.",
+        };
+      }
+      if (isDuplicatePasskeyCredentialSignal({ error })) {
+        const verifiedRecord = await verifyExistingPasskey();
+        return {
+          status: "already_configured",
+          message: "Passkey already exists for this account on this device. Protection is already active.",
+          passkeyRecord: verifiedRecord,
         };
       }
       const detail = error instanceof Error ? error.message : "Unknown passkey setup error";
@@ -1607,7 +1653,7 @@ function App() {
       const refreshedProfilePayload = await apiGetProfile();
       const capabilityEnvelope = await apiGetCapabilities();
       const passkeyResult = await registerLocalPasskey(backendSession.userId, profile?.email);
-      if (passkeyResult.status === "success" && passkeyResult.passkeyRecord) {
+      if ((passkeyResult.status === "success" || passkeyResult.status === "already_configured") && passkeyResult.passkeyRecord) {
         const recordToPersist: EncryptedVaultRecord = {
           ...vaultRecord,
           passkey: passkeyResult.passkeyRecord,
@@ -1621,11 +1667,7 @@ function App() {
       setLatestRecoverySecret(recoverySecretCode);
       setLatestRecoveryIssuedAt(new Date(now).toLocaleString());
       setPasskeySetupState({ status: passkeyResult.status, message: passkeyResult.message });
-      setEventLog(
-        passkeyResult.status === "success"
-          ? "Layer 2 unlocked: secure wallet + local passkey protected."
-          : `Layer 2 unlocked: secure wallet created. ${passkeyResult.message}`
-      );
+      setEventLog("Layer 2 unlocked: secure wallet created and linked.");
     });
   };
 
@@ -1667,7 +1709,7 @@ function App() {
     }
     void withBusy(async () => {
       const passkeyResult = await registerLocalPasskey(backendSession.userId, profile?.email);
-      if (passkeyResult.status === "success" && passkeyResult.passkeyRecord) {
+      if ((passkeyResult.status === "success" || passkeyResult.status === "already_configured") && passkeyResult.passkeyRecord) {
         const existingRecord = exportVaultCandidate?.record;
         const updatedRecord: EncryptedVaultRecord = {
           v: existingRecord?.v ?? 1,
@@ -2642,14 +2684,17 @@ function App() {
         {passkeySetupState.status !== "idle" ? (
           <p
             className={`dynamicStatus ${
-              passkeySetupState.status === "success" ? "dynamicStatus--ready" : "dynamicStatus--initializing"
+              passkeySetupState.status === "success" || passkeySetupState.status === "already_configured"
+                ? "dynamicStatus--ready"
+                : "dynamicStatus--initializing"
             }`}
           >
             {passkeySetupState.message}
           </p>
         ) : null}
         <small className="backupHint">
-          Status mapping: success=enrolled, skipped=user canceled/closed prompt, unsupported=platform/browser limitation.
+          Status mapping: success=enrolled, already_configured=enrolled already, skipped=user canceled/closed prompt,
+          unsupported=platform/browser limitation.
         </small>
         {latestRecoverySecret ? (
           <div className="securityList">
