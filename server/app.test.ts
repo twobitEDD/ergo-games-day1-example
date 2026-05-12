@@ -434,6 +434,44 @@ test("wallet binding updates wallet-state contract and keeps no-wager rewards pa
   }
 });
 
+test("account security state endpoint reflects wallet and dynamic linkage persistence", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "security-state-token") throw new Error("bad token");
+      return {
+        subject: "dyn_security_state_subject",
+        email: "dynamic-security-state@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Security State",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    await client.post("/api/auth/dynamic/login").send({ authToken: "security-state-token" }).expect(200);
+    const session = await client.get("/api/auth/session").expect(200);
+    await withCsrf(client, session.body.csrfToken as string, "post")("/api/wallet/bind")
+      .send({ walletAddress: "9hSecurityStateWalletStub" })
+      .expect(200);
+
+    const securityState = await client.get("/api/me/security-state").expect(200);
+    assert.equal(securityState.body.securityState.wallet.status, "bound_stub");
+    assert.equal(securityState.body.securityState.wallet.address, "9hSecurityStateWalletStub");
+    assert.equal(securityState.body.securityState.wallet.linked, true);
+    assert.equal(Array.isArray(securityState.body.securityState.identities), true);
+    assert.equal(securityState.body.securityState.identities[0].provider, "dynamic");
+    assert.equal(typeof securityState.body.securityState.lastUpdatedAt, "string");
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic outage keeps local registry auth and identity continuity available", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");

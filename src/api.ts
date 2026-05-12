@@ -50,6 +50,26 @@ export interface ApiProfile extends Omit<PlayerProfile, "walletStatus"> {
   walletStatus: "unbound" | "bound_stub";
 }
 
+export interface ApiAccountSecurityState {
+  userId: string;
+  wallet: {
+    status: "unbound" | "bound_stub";
+    address?: string;
+    linked: boolean;
+    updatedAt?: string;
+  };
+  identities: Array<{
+    provider: string;
+    subject: string;
+    linked: boolean;
+    emailAtLink?: string;
+    displayNameAtLink?: string;
+    createdAt: string;
+    lastSeenAt: string;
+  }>;
+  lastUpdatedAt: string;
+}
+
 export interface ApiGame {
   gameId: string;
   gameType: GameType;
@@ -428,6 +448,13 @@ export const clearClientAuthBootstrap = () => {
 
 export const apiGetProfile = (sessionToken?: string) =>
   fetchJson<{ scaffold: true; profile: ApiProfile }>("/api/me/profile", { method: "GET" }, sessionToken);
+
+export const apiGetAccountSecurityState = (sessionToken?: string) =>
+  fetchJson<{ scaffold: true; securityState: ApiAccountSecurityState }>(
+    "/api/me/security-state",
+    { method: "GET" },
+    sessionToken
+  );
 
 export const apiBindWallet = (walletAddress: string, sessionToken?: string) =>
   fetchJson<{

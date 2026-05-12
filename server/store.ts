@@ -41,6 +41,26 @@ export interface ProfileRecord {
   wins: number;
 }
 
+export interface AccountSecurityStateRecord {
+  userId: string;
+  wallet: {
+    status: "unbound" | "bound_stub";
+    address?: string;
+    linked: boolean;
+    updatedAt?: string;
+  };
+  identities: Array<{
+    provider: string;
+    subject: string;
+    linked: boolean;
+    emailAtLink?: string;
+    displayNameAtLink?: string;
+    createdAt: string;
+    lastSeenAt: string;
+  }>;
+  lastUpdatedAt: string;
+}
+
 export interface GameEventRecord {
   type: "MOVE_APPLIED";
   actorUserId: string;
@@ -949,6 +969,68 @@ export class Day1Store {
       gamesPlayed: row.games_played ?? 0,
       wins: row.wins ?? 0,
     } satisfies ProfileRecord;
+  }
+
+  getAccountSecurityState(userId: string): AccountSecurityStateRecord | null {
+    const profile = this.getProfile(userId);
+    if (!profile) return null;
+    const accountRow = this.db
+      .prepare("SELECT last_active_at FROM accounts WHERE user_id = ?")
+      .get(userId) as { last_active_at: string } | undefined;
+    const walletRow = this.db
+      .prepare(
+        `SELECT wallet_address, wallet_status, updated_at
+         FROM wallet_bindings
+         WHERE user_id = ?`
+      )
+      .get(userId) as
+      | {
+          wallet_address: string;
+          wallet_status: "unbound" | "bound_stub";
+          updated_at: string;
+        }
+      | undefined;
+    const identityRows = this.db
+      .prepare(
+        `SELECT provider, provider_subject, email_at_link, display_name_at_link, created_at, last_seen_at
+         FROM account_identities
+         WHERE user_id = ?
+         ORDER BY created_at DESC`
+      )
+      .all(userId) as Array<{
+      provider: string;
+      provider_subject: string;
+      email_at_link: string | null;
+      display_name_at_link: string | null;
+      created_at: string;
+      last_seen_at: string;
+    }>;
+
+    const walletUpdatedAt = walletRow?.updated_at;
+    const latestIdentityUpdatedAt = identityRows[0]?.last_seen_at;
+    const updatedCandidates = [accountRow?.last_active_at, walletUpdatedAt, latestIdentityUpdatedAt]
+      .filter((value): value is string => typeof value === "string")
+      .sort((a, b) => Date.parse(b) - Date.parse(a));
+
+    return {
+      userId,
+      wallet: {
+        status: profile.walletStatus,
+        address: profile.walletAddress,
+        linked: profile.walletStatus === "bound_stub" && Boolean(profile.walletAddress?.trim()),
+        updatedAt: walletUpdatedAt,
+      },
+      identities: identityRows.map((entry) => ({
+        provider: entry.provider,
+        subject: entry.provider_subject,
+        linked: true,
+        emailAtLink: entry.email_at_link ?? undefined,
+        displayNameAtLink: entry.display_name_at_link ?? undefined,
+        createdAt: entry.created_at,
+        lastSeenAt: entry.last_seen_at,
+      })),
+      lastUpdatedAt: updatedCandidates[0] ?? new Date().toISOString(),
+    };
   }
 
   bindWallet(userId: string, walletAddress: string) {

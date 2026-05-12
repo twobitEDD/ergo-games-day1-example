@@ -1147,6 +1147,17 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     res.json({ scaffold: true, profile: auth.profile });
   });
 
+  app.get("/api/me/security-state", (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const securityState = store.getAccountSecurityState(auth.session.userId);
+    if (!securityState) {
+      res.status(404).json({ error: "PROFILE_NOT_FOUND" });
+      return;
+    }
+    res.json({ scaffold: true, securityState });
+  });
+
   app.post("/api/auth/mfa/totp/enroll/start", (req, res) => {
     const auth = requireAuthForMutation(req, res);
     if (!auth) return;

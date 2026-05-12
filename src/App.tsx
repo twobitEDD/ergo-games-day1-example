@@ -35,6 +35,7 @@ import {
   apiGetProfile,
   apiGetRewards,
   apiGetCapabilities,
+  apiGetAccountSecurityState,
   apiSignOut,
   apiGetSession,
   apiMove,
@@ -53,6 +54,7 @@ import {
   type ApiGame,
   type ApiSession,
   type ApiProfile,
+  type ApiAccountSecurityState,
   type ApiSecurityMetric,
   type ApiGameCompletion,
   type ApiGameStatus,
@@ -218,6 +220,45 @@ const encryptRecoveryPayload = async (
   };
 };
 
+const decryptRecoveryPayload = async (
+  recoverySecretCode: string,
+  encryptedPayload: { iv?: unknown; ciphertext?: unknown; salt?: unknown } | null | undefined
+): Promise<Record<string, unknown> | null> => {
+  if (
+    !encryptedPayload ||
+    typeof encryptedPayload.iv !== "string" ||
+    typeof encryptedPayload.ciphertext !== "string" ||
+    typeof encryptedPayload.salt !== "string"
+  ) {
+    return null;
+  }
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(recoverySecretCode),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  const key = await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: Uint8Array.from(window.atob(encryptedPayload.salt), (char) => char.charCodeAt(0)),
+      iterations: 160000,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: Uint8Array.from(window.atob(encryptedPayload.iv), (char) => char.charCodeAt(0)) },
+    key,
+    Uint8Array.from(window.atob(encryptedPayload.ciphertext), (char) => char.charCodeAt(0))
+  );
+  return JSON.parse(new TextDecoder().decode(decrypted)) as Record<string, unknown>;
+};
+
 const toSecurityFirstCopy = (value: string): string =>
   value
     .replace(/\b[Bb]ind wallet\b/g, "Create secure wallet")
@@ -286,6 +327,10 @@ type PasskeySetupState =
   | { status: "idle"; message: null }
   | { status: "success" | "unsupported" | "skipped" | "error"; message: string };
 
+type RecoveryImportState =
+  | { status: "idle"; message: null }
+  | { status: "success" | "warning" | "error"; message: string };
+
 const DynamicLoginPanel = ({
   busy,
   isSignedIn,
@@ -347,6 +392,7 @@ function App() {
   const [walletAddress, setWalletAddress] = useState("");
   const [backendSession, setBackendSession] = useState<ApiSession | null>(null);
   const [profile, setProfile] = useState<ApiProfile | null>(null);
+  const [accountSecurityState, setAccountSecurityState] = useState<ApiAccountSecurityState | null>(null);
   const [sessionCapabilities, setSessionCapabilities] = useState<ProgressiveAccountCapabilities | null>(null);
   const [games, setGames] = useState<ApiGameListItem[]>([]);
   const [gameTypes, setGameTypes] = useState<GameTypeMetadata[]>([]);
@@ -383,6 +429,8 @@ function App() {
   const [eventLog, setEventLog] = useState("Ready. Sign in with Dynamic or start as guest.");
   const [latestRecoverySecret, setLatestRecoverySecret] = useState<string | null>(null);
   const [latestRecoveryIssuedAt, setLatestRecoveryIssuedAt] = useState<string | null>(null);
+  const [recoverySecretInput, setRecoverySecretInput] = useState("");
+  const [recoveryImportState, setRecoveryImportState] = useState<RecoveryImportState>({ status: "idle", message: null });
   const [lastBackupExportAt, setLastBackupExportAt] = useState<string | null>(null);
   const [isSecureWalletModalOpen, setIsSecureWalletModalOpen] = useState(false);
   const [secureWalletConfirmationChecked, setSecureWalletConfirmationChecked] = useState(false);
@@ -398,6 +446,7 @@ function App() {
   const [dynamicAuthMode, setDynamicAuthMode] = useState<"jwt_verified" | null>(null);
   const lobbyRequestRef = useRef(0);
   const walletBindingSectionRef = useRef<HTMLElement | null>(null);
+  const walletRecoverySectionRef = useRef<HTMLElement | null>(null);
   const walletAddressInputRef = useRef<HTMLInputElement | null>(null);
 
   const gameStatus = useMemo(() => {
@@ -444,7 +493,19 @@ function App() {
     }
     return `${dynamic.reason ?? "Dynamic is unavailable."} Fix Dynamic dashboard origins/domains and verify env values before retrying.`;
   }, [dynamic.availability, dynamic.reason]);
-  const exportVaultCandidate = useMemo(() => loadExportVaultCandidate(dynamicUser), [dynamicUser]);
+  const exportVaultCandidate = loadExportVaultCandidate(dynamicUser);
+  const localPasskeyRecord =
+    exportVaultCandidate?.record.passkey &&
+    typeof exportVaultCandidate.record.passkey === "object"
+      ? (exportVaultCandidate.record.passkey as LocalPasskeyRecord)
+      : null;
+  const hasLocalPasskey = Boolean(localPasskeyRecord?.credentialId);
+  const passkeyFeatureSupported =
+    typeof window !== "undefined" &&
+    window.isSecureContext &&
+    typeof navigator !== "undefined" &&
+    "PublicKeyCredential" in window &&
+    Boolean(navigator.credentials?.create);
   const externalAuthRef =
     (typeof dynamicUser?.userId === "string" && dynamicUser.userId.trim()
       ? dynamicUser.userId
@@ -563,13 +624,18 @@ function App() {
     }
   };
 
+  const refreshAccountSecurityState = async () => {
+    const payload = await apiGetAccountSecurityState();
+    setAccountSecurityState(payload.securityState);
+  };
+
   const refreshProfile = async () => {
     const session = await apiGetSession();
     const me = await apiGetProfile();
     setBackendSession(session.session);
     setProfile(me.profile);
     setSessionCapabilities(session.capabilities);
-    await Promise.all([refreshSecurityPosture(), refreshRatificationState()]);
+    await Promise.all([refreshSecurityPosture(), refreshRatificationState(), refreshAccountSecurityState()]);
     setEventLog(`Session verified for ${session.profile.displayName}`);
   };
 
@@ -609,6 +675,7 @@ function App() {
   const resetSessionState = useCallback((reason: string) => {
     setBackendSession(null);
     setProfile(null);
+    setAccountSecurityState(null);
     setSessionCapabilities(null);
     setGames([]);
     setGameTypes([]);
@@ -638,6 +705,7 @@ function App() {
     setSignedTxHex("");
     setDynamicAuthMode(null);
     setAuthBlockingReason(null);
+    setRecoveryImportState({ status: "idle", message: null });
     setEventLog(reason);
   }, []);
 
@@ -733,10 +801,11 @@ function App() {
   };
 
   const refreshPostLoginState = async () => {
-    const [lobbyResult, securityResult, ratificationResult] = await Promise.allSettled([
+    const [lobbyResult, securityResult, ratificationResult, accountSecurityResult] = await Promise.allSettled([
       refreshLobbyAndDirectory(),
       refreshSecurityPosture(),
       refreshRatificationState(),
+      refreshAccountSecurityState(),
     ]);
     if (lobbyResult.status === "rejected") {
       if (isTransientSessionHydrationError(lobbyResult.reason)) {
@@ -747,7 +816,7 @@ function App() {
       }
       throw lobbyResult.reason;
     }
-    const nonBlockingFailures = [securityResult, ratificationResult].filter(
+    const nonBlockingFailures = [securityResult, ratificationResult, accountSecurityResult].filter(
       (result): result is PromiseRejectedResult => result.status === "rejected"
     );
     return { partialFailures: nonBlockingFailures.length > 0 };
@@ -1096,7 +1165,7 @@ function App() {
       setProfile(session.profile);
       setSessionCapabilities(session.capabilities);
       setAuthBlockingReason(null);
-      await refreshLobbyAndDirectory();
+      await Promise.all([refreshLobbyAndDirectory(), refreshAccountSecurityState()]);
       setEventLog(`Recovered Day1 session for ${session.profile.displayName}.`);
     });
   };
@@ -1111,6 +1180,7 @@ function App() {
       const capabilityEnvelope = await apiGetCapabilities();
       setProfile(payload.profile);
       setSessionCapabilities(capabilityEnvelope.capabilities);
+      await refreshAccountSecurityState();
       setEventLog("Layer 2 unlocked: ownership setup linked for rewards.");
     });
   };
@@ -1155,7 +1225,9 @@ function App() {
       };
     }
 
-    const hasPlatformAuthenticator = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.();
+    const hasPlatformAuthenticator = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.().catch(
+      () => null
+    );
     if (hasPlatformAuthenticator === false) {
       return {
         status: "unsupported",
@@ -1298,6 +1370,7 @@ function App() {
       setProfile(payload.profile);
       setWalletAddress(walletAddressToLink);
       setSessionCapabilities(capabilityEnvelope.capabilities);
+      await refreshAccountSecurityState();
       setLatestRecoverySecret(recoverySecretCode);
       setLatestRecoveryIssuedAt(new Date(now).toLocaleString());
       setPasskeySetupState({ status: passkeyResult.status, message: passkeyResult.message });
@@ -1319,6 +1392,118 @@ function App() {
     }
     walletBindingSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     setEventLog("Layer 2 security setup ready: create your secure wallet to unlock rewards.");
+  };
+
+  const handleOpenRecoverWallet = () => {
+    if (!backendSession) {
+      setEventLog("Sign in first to use wallet recovery tools.");
+      return;
+    }
+    walletRecoverySectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setEventLog("Wallet recovery tools opened. Provide your recovery secret to validate/import.");
+  };
+
+  const handleSetupPasskey = () => {
+    if (!backendSession) {
+      setEventLog("Sign in first to set up a passkey.");
+      return;
+    }
+    if (!profile?.walletAddress?.trim()) {
+      setEventLog("Create or link a secure wallet first, then add a passkey.");
+      return;
+    }
+    void withBusy(async () => {
+      const passkeyResult = await registerLocalPasskey(backendSession.userId, profile?.email);
+      if (passkeyResult.status === "success" && passkeyResult.passkeyRecord) {
+        const existingRecord = exportVaultCandidate?.record;
+        const updatedRecord: EncryptedVaultRecord = {
+          v: existingRecord?.v ?? 1,
+          ergoAddress: existingRecord?.ergoAddress ?? profile.walletAddress ?? "",
+          recoveryEncrypted: existingRecord?.recoveryEncrypted ?? null,
+          createdAt: existingRecord?.createdAt ?? Date.now(),
+          passkey: passkeyResult.passkeyRecord,
+        };
+        window.localStorage.setItem(ENCRYPTED_VAULT_LOCAL_STORAGE_KEY, JSON.stringify(updatedRecord));
+      }
+      setPasskeySetupState({ status: passkeyResult.status, message: passkeyResult.message });
+      setEventLog(passkeyResult.message);
+    });
+  };
+
+  const handleRecoverWalletFromSecret = () => {
+    if (!backendSession) {
+      setEventLog("Sign in first to recover wallet linkage.");
+      return;
+    }
+    void withBusy(async () => {
+      const normalized = recoverySecretInput.trim().toUpperCase();
+      if (!normalized) {
+        setRecoveryImportState({ status: "error", message: "Enter your recovery secret code first." });
+        return;
+      }
+      const encryptedRecoveryPayload = exportVaultCandidate?.record.recoveryEncrypted;
+      if (!encryptedRecoveryPayload?.ciphertext) {
+        setRecoveryImportState({
+          status: "warning",
+          message:
+            "This browser has no encrypted recovery payload to decrypt. Current support can validate/import from local backup material only; cross-device deterministic restore requires backend recovery artifact support.",
+        });
+        return;
+      }
+
+      const candidates = [normalized, normalized.replaceAll("-", "")];
+      let recoveredPayload: Record<string, unknown> | null = null;
+      for (const candidate of candidates) {
+        const grouped = candidate.includes("-") ? candidate : candidate.match(/.{1,4}/g)?.join("-") ?? candidate;
+        try {
+          recoveredPayload = await decryptRecoveryPayload(grouped, encryptedRecoveryPayload);
+          if (recoveredPayload) break;
+        } catch {
+          recoveredPayload = null;
+        }
+      }
+      if (!recoveredPayload) {
+        setRecoveryImportState({
+          status: "error",
+          message: "Recovery secret could not decrypt local payload. Verify the code and try again.",
+        });
+        return;
+      }
+
+      const recoveredAddress =
+        typeof recoveredPayload.ergoAddress === "string" ? recoveredPayload.ergoAddress.trim() : "";
+      if (!recoveredAddress) {
+        setRecoveryImportState({
+          status: "error",
+          message: "Recovery payload decrypted but no wallet address was present.",
+        });
+        return;
+      }
+
+      const backendAddress = accountSecurityState?.wallet.address?.trim();
+      const alreadyLinked =
+        accountSecurityState?.wallet.linked && backendAddress && backendAddress === recoveredAddress;
+      if (alreadyLinked) {
+        setRecoveryImportState({
+          status: "success",
+          message: `Recovery secret validated. Backend already links wallet ${recoveredAddress}.`,
+        });
+        setEventLog("Recovery secret validated against persisted backend linkage.");
+        return;
+      }
+
+      const bindPayload = await apiBindWallet(recoveredAddress);
+      const capabilityEnvelope = await apiGetCapabilities();
+      setProfile(bindPayload.profile);
+      setWalletAddress(recoveredAddress);
+      setSessionCapabilities(capabilityEnvelope.capabilities);
+      await refreshAccountSecurityState();
+      setRecoveryImportState({
+        status: "success",
+        message: `Recovery secret validated and backend wallet linkage restored to ${recoveredAddress}.`,
+      });
+      setEventLog("Wallet linkage restored from recovery secret payload.");
+    });
   };
 
   const handleExportWalletBackup = () => {
@@ -1643,16 +1828,24 @@ function App() {
             {!isSignedIn ? (
               <small className="layerActionHint">Complete Layer 1 login before secure setup can start.</small>
             ) : progressiveCapabilities.layers.rewards.eligible ? (
-              <small className="layerActionHint">
-                Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
-              </small>
+              <div className="row progressiveActionRow">
+                <small className="layerActionHint">
+                  Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
+                </small>
+                <button type="button" disabled={busy} onClick={handleOpenRecoverWallet}>
+                  Recover Wallet
+                </button>
+              </div>
             ) : (
               <div className="row progressiveActionRow">
                 <button type="button" disabled={busy} onClick={handleLayer2WalletSetup}>
                   Create Secure Wallet
                 </button>
+                <button type="button" disabled={busy} onClick={handleOpenRecoverWallet}>
+                  Recover Wallet
+                </button>
                 <small className="layerActionHint">
-                  Create your managed wallet and save a recovery code to activate Layer 2 rewards.
+                  Create your managed wallet and save a recovery code, or recover linkage from an existing secret.
                 </small>
               </div>
             )}
@@ -1952,6 +2145,43 @@ function App() {
         )}
       </section>
 
+      <section className="panel">
+        <h2>Account Security Linkage (Backend)</h2>
+        {!isSignedIn ? (
+          <p className="accountEmpty">Sign in to inspect persisted wallet/account linkage state.</p>
+        ) : (
+          <>
+            <div className="accountGrid">
+              <span>Wallet Address</span>
+              <code>{accountSecurityState?.wallet.address ?? "not linked"}</code>
+              <span>Wallet Linked</span>
+              <strong>{accountSecurityState?.wallet.linked ? "yes" : "no"}</strong>
+              <span>Dynamic Identity Linked</span>
+              <strong>{accountSecurityState?.identities.some((entry) => entry.provider === "dynamic") ? "yes" : "no"}</strong>
+              <span>Primary Dynamic Subject</span>
+              <code>
+                {accountSecurityState?.identities.find((entry) => entry.provider === "dynamic")?.subject ?? "none"}
+              </code>
+              <span>Wallet Link Updated</span>
+              <strong>
+                {accountSecurityState?.wallet.updatedAt
+                  ? new Date(accountSecurityState.wallet.updatedAt).toLocaleString()
+                  : "not linked"}
+              </strong>
+              <span>Security State Updated</span>
+              <strong>
+                {accountSecurityState?.lastUpdatedAt
+                  ? new Date(accountSecurityState.lastUpdatedAt).toLocaleString()
+                  : "n/a"}
+              </strong>
+            </div>
+            <small className="backupHint">
+              Values above come from persisted backend records (`wallet_bindings` + `account_identities`), not client-only state.
+            </small>
+          </>
+        )}
+      </section>
+
       <section className="panel" ref={walletBindingSectionRef}>
         <h2>3) Secure Wallet Setup</h2>
         <p className="panelHint">
@@ -1961,8 +2191,24 @@ function App() {
           <button type="button" disabled={busy || !backendSession} onClick={handleOpenCreateSecureWalletModal}>
             Create Secure Wallet
           </button>
+          <button
+            type="button"
+            disabled={busy || !backendSession || !profile?.walletAddress?.trim()}
+            onClick={handleSetupPasskey}
+          >
+            Set Up Passkey (Touch ID / Face ID)
+          </button>
           <small>Uses Dynamic-backed identity plus Day1 account linkage for ownership continuity.</small>
         </div>
+        <small className="backupHint">
+          Passkey support:{" "}
+          {hasLocalPasskey
+            ? "supported + enrolled (local device record)"
+            : passkeyFeatureSupported
+              ? "supported but not enrolled yet"
+              : "unsupported on this browser/platform context"}
+          . Passkey enrollment is local-only today; backend authoritative passkey persistence is pending.
+        </small>
         {passkeySetupState.status !== "idle" ? (
           <p
             className={`dynamicStatus ${
@@ -1970,11 +2216,11 @@ function App() {
             }`}
           >
             {passkeySetupState.message}
-            {passkeySetupState.status !== "success"
-              ? " TODO: persist passkey registration server-side when a backend endpoint is available."
-              : ""}
           </p>
         ) : null}
+        <small className="backupHint">
+          Status mapping: success=enrolled, skipped=user canceled/closed prompt, unsupported=platform/browser limitation.
+        </small>
         {latestRecoverySecret ? (
           <div className="securityList">
             <strong>Recovery secret code (save offline now)</strong>
@@ -1984,6 +2230,36 @@ function App() {
             </small>
           </div>
         ) : null}
+        <div className="securityList" ref={walletRecoverySectionRef}>
+          <strong>Recover wallet linkage from secret</strong>
+          <small>
+            This validates your recovery secret against encrypted payload available in this browser/device backup and can
+            restore backend wallet linkage when data is present.
+          </small>
+          <div className="row">
+            <input
+              value={recoverySecretInput}
+              onChange={(event) => setRecoverySecretInput(event.target.value)}
+              placeholder="Recovery secret code"
+            />
+            <button type="button" disabled={busy || !backendSession || !recoverySecretInput.trim()} onClick={handleRecoverWalletFromSecret}>
+              Validate / Import Recovery
+            </button>
+          </div>
+          {recoveryImportState.status !== "idle" ? (
+            <p
+              className={`dynamicStatus ${
+                recoveryImportState.status === "success"
+                  ? "dynamicStatus--ready"
+                  : recoveryImportState.status === "warning"
+                    ? "dynamicStatus--initializing"
+                    : "dynamicStatus--degraded"
+              }`}
+            >
+              {recoveryImportState.message}
+            </p>
+          ) : null}
+        </div>
         <details>
           <summary>Advanced: link an existing wallet address</summary>
           <div className="row">
