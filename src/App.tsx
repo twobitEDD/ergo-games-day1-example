@@ -353,18 +353,38 @@ const DynamicLoginPanel = ({
 
   return (
     <div className="row">
-      <button type="button" disabled={busy || !dynamic.enabled || !dynamic.configured} onClick={dynamic.openAuthFlow}>
+      <button
+        type="button"
+        title="Open Dynamic login/signup so you can connect identity before syncing to Day1."
+        disabled={busy || !dynamic.enabled || !dynamic.configured}
+        onClick={dynamic.openAuthFlow}
+      >
         Open Dynamic Auth
       </button>
       {dynamic.availability === "idle" ? (
-        <button type="button" disabled={busy || !dynamic.enabled || !dynamic.configured} onClick={dynamic.requestActivation}>
+        <button
+          type="button"
+          title="Activate the optional Dynamic auth module when it has not been initialized yet."
+          disabled={busy || !dynamic.enabled || !dynamic.configured}
+          onClick={dynamic.requestActivation}
+        >
           Enable Dynamic Auth Module
         </button>
       ) : null}
-      <button type="button" disabled={busy || !authTokenReady} onClick={handleSync}>
+      <button
+        type="button"
+        title="Exchange Dynamic identity for a Day1 backend session used by onboarding and gameplay."
+        disabled={busy || !authTokenReady}
+        onClick={handleSync}
+      >
         {syncInProgress ? "Syncing Dynamic -> Day1..." : "Dynamic -> Day1 Session"}
       </button>
-      <button type="button" disabled={busy || !sdkReady || !dynamicUser} onClick={() => void dynamic.signOut()}>
+      <button
+        type="button"
+        title="Sign out from Dynamic in this browser."
+        disabled={busy || !sdkReady || !dynamicUser}
+        onClick={() => void dynamic.signOut()}
+      >
         Dynamic Sign Out
       </button>
       <small>
@@ -1185,19 +1205,6 @@ function App() {
     });
   };
 
-  const handleOpenCreateSecureWalletModal = () => {
-    if (!backendSession) {
-      setEventLog("Sign in first to complete account security setup.");
-      return;
-    }
-    if (!dynamic.user && dynamicAuthMode !== "jwt_verified") {
-      setEventLog("Complete Dynamic sign-in first, then create your secure wallet.");
-      return;
-    }
-    setSecureWalletConfirmationChecked(false);
-    setIsSecureWalletModalOpen(true);
-  };
-
   const registerLocalPasskey = async (
     accountUserId: string,
     accountEmail?: string
@@ -1387,11 +1394,17 @@ function App() {
       setEventLog("Layer 2 requires Layer 1 login. Sign in first, then create your secure wallet.");
       return;
     }
+    if (!dynamic.user && dynamicAuthMode !== "jwt_verified") {
+      setEventLog("Complete Dynamic sign-in first, then create your secure wallet.");
+      return;
+    }
     if (!walletAddress.trim() && profile?.walletAddress) {
       setWalletAddress(profile.walletAddress);
     }
     walletBindingSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    setEventLog("Layer 2 security setup ready: create your secure wallet to unlock rewards.");
+    setSecureWalletConfirmationChecked(false);
+    setIsSecureWalletModalOpen(true);
+    setEventLog("Layer 2 security setup ready: confirm secure wallet creation to unlock rewards.");
   };
 
   const handleOpenRecoverWallet = () => {
@@ -1796,10 +1809,10 @@ function App() {
       </p>
       <p className="trustLabel">No-wager trusted demo flow</p>
 
-      <section className="panel">
-        <h2>1) Account Access</h2>
+      <section className="panel toolboxPanel">
+        <h2>1) Toolbox</h2>
         <p className="panelHint">
-          Dynamic.xyz is optional authentication. Day1 server registry is the authoritative account identity.
+          Use these grouped actions for onboarding. Required actions are surfaced first; legacy/diagnostic paths are tucked under Advanced.
         </p>
         {(dynamic.enabled || dynamic.active || dynamic.availability === "initializing") ? (
           <DynamicLoginPanel
@@ -1828,26 +1841,13 @@ function App() {
             {!isSignedIn ? (
               <small className="layerActionHint">Complete Layer 1 login before secure setup can start.</small>
             ) : progressiveCapabilities.layers.rewards.eligible ? (
-              <div className="row progressiveActionRow">
-                <small className="layerActionHint">
-                  Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
-                </small>
-                <button type="button" disabled={busy} onClick={handleOpenRecoverWallet}>
-                  Recover Wallet
-                </button>
-              </div>
+              <small className="layerActionHint">
+                Rewards security setup complete: {profile?.walletAddress ?? "address unavailable"}.
+              </small>
             ) : (
-              <div className="row progressiveActionRow">
-                <button type="button" disabled={busy} onClick={handleLayer2WalletSetup}>
-                  Create Secure Wallet
-                </button>
-                <button type="button" disabled={busy} onClick={handleOpenRecoverWallet}>
-                  Recover Wallet
-                </button>
-                <small className="layerActionHint">
-                  Create your managed wallet and save a recovery code, or recover linkage from an existing secret.
-                </small>
-              </div>
+              <small className="layerActionHint">
+                Create your managed wallet and save a recovery code, or recover linkage from an existing secret.
+              </small>
             )}
           </div>
           <div className="progressiveLayer">
@@ -1861,38 +1861,251 @@ function App() {
             ownership features as needed.
           </small>
         </div>
-        <div className="row">
-          <button type="button" disabled={busy || isSignedIn} onClick={handleGuestLogin}>
-            Continue as Guest
-          </button>
-          <small>Guest mode is for local testing only and is not used as Dynamic fallback.</small>
+        <div className="toolboxGrid">
+          <div className="toolboxGroup">
+            <h3>Account Access (Required)</h3>
+            <div className="row">
+              <button
+                type="button"
+                title="Start a temporary local guest session for quick testing."
+                disabled={busy || isSignedIn}
+                onClick={handleGuestLogin}
+              >
+                Continue as Guest
+              </button>
+            </div>
+            <div className="row">
+              <input
+                title="Display name used for local account registration."
+                value={localAuthDisplayName}
+                onChange={(event) => setLocalAuthDisplayName(event.target.value)}
+                placeholder="Display name"
+              />
+              <input
+                title="Email for local Day1 account login/recovery."
+                value={localAuthEmail}
+                onChange={(event) => setLocalAuthEmail(event.target.value)}
+                placeholder="Email"
+                type="email"
+              />
+              <input
+                title="Password for local Day1 account registration/login."
+                value={localAuthPassword}
+                onChange={(event) => setLocalAuthPassword(event.target.value)}
+                placeholder="Password"
+                type="password"
+              />
+              <button
+                type="button"
+                title="Create a local Day1 account when Dynamic is unavailable."
+                disabled={busy || isSignedIn}
+                onClick={handleLocalRegister}
+              >
+                Register Local Account
+              </button>
+              <button
+                type="button"
+                title="Sign in with an existing local Day1 email/password account."
+                disabled={busy || isSignedIn}
+                onClick={handleLocalLogin}
+              >
+                Local Login
+              </button>
+            </div>
+            <small>Dynamic unavailable? Use local login/register to keep server identity continuity.</small>
+          </div>
+          <div className="toolboxGroup">
+            <h3>Security / Recovery (Layer 2+)</h3>
+            <div className="row">
+              <button
+                type="button"
+                title="Create a managed wallet and recovery secret to unlock Layer 2 rewards."
+                disabled={busy}
+                onClick={handleLayer2WalletSetup}
+              >
+                Create Secure Wallet
+              </button>
+              <button
+                type="button"
+                title="Open wallet recovery tools to validate or restore wallet linkage from a recovery secret."
+                disabled={busy}
+                onClick={handleOpenRecoverWallet}
+              >
+                Recover Wallet
+              </button>
+              <button
+                type="button"
+                title="Register a local device passkey (Touch ID/Face ID) after wallet setup."
+                disabled={busy || !backendSession || !profile?.walletAddress?.trim()}
+                onClick={handleSetupPasskey}
+              >
+                Set Up Passkey
+              </button>
+            </div>
+            <small>Layer 2 requires Layer 1 login. Layer 3 remains gated by security posture readiness.</small>
+          </div>
+          <div className="toolboxGroup">
+            <h3>Wallet / Session</h3>
+            <div className="row">
+              <button
+                type="button"
+                title="Rehydrate active session context and lobby data from the backend."
+                disabled={busy}
+                onClick={handleRecoverSession}
+              >
+                Recover Session + Lobby
+              </button>
+              <button
+                type="button"
+                title="Reload backend profile/account state and capability snapshots."
+                disabled={busy || !backendSession}
+                onClick={() => void withBusy(() => refreshProfile())}
+              >
+                Refresh Backend Account
+              </button>
+              <button
+                type="button"
+                title="Refresh account security posture, trusted devices, and security metrics."
+                disabled={busy || !backendSession}
+                onClick={() => void withBusy(() => refreshSecurityPosture())}
+              >
+                Refresh Security State
+              </button>
+              <button
+                type="button"
+                title="Download a local wallet portability backup JSON artifact."
+                disabled={busy || !backendSession}
+                onClick={handleExportWalletBackup}
+              >
+                Export Wallet Backup
+              </button>
+            </div>
+          </div>
+          <details className="toolboxAdvanced">
+            <summary>Advanced / Diagnostics</summary>
+            <div className="toolboxGroup">
+              <h3>Legacy Email Recovery</h3>
+              <div className="row">
+                <input
+                  title="Email address for requesting a password recovery reset token."
+                  value={recoveryEmail}
+                  onChange={(event) => setRecoveryEmail(event.target.value)}
+                  placeholder="Recovery email"
+                />
+                <button
+                  type="button"
+                  title="Request a recovery email token for local account password reset."
+                  disabled={busy}
+                  onClick={handleRecoveryRequest}
+                >
+                  Request Recovery
+                </button>
+              </div>
+              <div className="row">
+                <input
+                  title="Password reset token received from the recovery path."
+                  value={recoveryToken}
+                  onChange={(event) => setRecoveryToken(event.target.value)}
+                  placeholder="Reset token"
+                />
+                <input
+                  title="New password to set with the reset token."
+                  value={recoveryNewPassword}
+                  onChange={(event) => setRecoveryNewPassword(event.target.value)}
+                  placeholder="New password"
+                  type="password"
+                />
+                <button
+                  type="button"
+                  title="Complete local password reset using the recovery token."
+                  disabled={busy || !recoveryToken.trim()}
+                  onClick={handleRecoveryReset}
+                >
+                  Reset Password
+                </button>
+              </div>
+            </div>
+            <div className="toolboxGroup">
+              <h3>MFA / Device Diagnostics</h3>
+              <div className="row">
+                <button
+                  type="button"
+                  title="Start time-based one-time password enrollment for this account."
+                  disabled={busy || !backendSession}
+                  onClick={handleTotpEnrollStart}
+                >
+                  Start TOTP Enrollment
+                </button>
+                <input
+                  title="6-digit authenticator code used to verify TOTP enrollment."
+                  value={mfaCodeInput}
+                  onChange={(event) => setMfaCodeInput(event.target.value)}
+                  placeholder="6-digit TOTP"
+                />
+                <button
+                  type="button"
+                  title="Verify TOTP enrollment with the current authenticator code."
+                  disabled={busy || !backendSession}
+                  onClick={handleTotpEnrollVerify}
+                >
+                  Verify Enrollment
+                </button>
+                <button
+                  type="button"
+                  title="Disable account TOTP if you need to reset MFA state."
+                  disabled={busy || !backendSession}
+                  onClick={handleTotpDisable}
+                >
+                  Disable TOTP
+                </button>
+                <button
+                  type="button"
+                  title="Mark this browser/device as trusted."
+                  disabled={busy || !backendSession}
+                  onClick={handleTrustCurrentDevice}
+                >
+                  Trust This Device
+                </button>
+              </div>
+              <div className="row">
+                <input
+                  ref={walletAddressInputRef}
+                  title="Existing wallet address to attach instead of creating a managed wallet."
+                  value={walletAddress}
+                  onChange={(event) => setWalletAddress(event.target.value)}
+                  placeholder="Existing wallet address"
+                />
+                <button
+                  type="button"
+                  title="Link an externally-managed wallet address to the current Day1 account."
+                  disabled={busy || !backendSession}
+                  onClick={handleWalletBind}
+                >
+                  Link Existing Wallet
+                </button>
+                <button
+                  type="button"
+                  title="Sign out from the active backend Day1 session."
+                  disabled={busy || !backendSession}
+                  onClick={handleSignOut}
+                >
+                  Sign Out (Backend Session)
+                </button>
+                <button
+                  type="button"
+                  title="Clear local cached auth bootstrap/session state in this browser."
+                  disabled={busy}
+                  onClick={() => {
+                    clearClientAuthBootstrap();
+                    resetSessionState("Local session state reset. Sign in again to create a new backend session.");
+                  }}
+                >
+                  Reset Local Session
+                </button>
+              </div>
+            </div>
+          </details>
         </div>
-        <div className="row">
-          <input
-            value={localAuthDisplayName}
-            onChange={(event) => setLocalAuthDisplayName(event.target.value)}
-            placeholder="Display name"
-          />
-          <input
-            value={localAuthEmail}
-            onChange={(event) => setLocalAuthEmail(event.target.value)}
-            placeholder="Email"
-            type="email"
-          />
-          <input
-            value={localAuthPassword}
-            onChange={(event) => setLocalAuthPassword(event.target.value)}
-            placeholder="Password"
-            type="password"
-          />
-          <button type="button" disabled={busy || isSignedIn} onClick={handleLocalRegister}>
-            Register Local Account
-          </button>
-          <button type="button" disabled={busy || isSignedIn} onClick={handleLocalLogin}>
-            Local Login
-          </button>
-        </div>
-        <small>Dynamic unavailable? Use local login/register to keep server identity continuity.</small>
         {dynamicStatusMessage ? (
           <p className={`dynamicStatus dynamicStatus--${dynamic.availability}`}>
             {dynamicStatusMessage}
@@ -1912,64 +2125,11 @@ function App() {
             {authBlockingReason} Action: click Dynamic -&gt; Day1 Session, then Recover Session + Lobby.
           </p>
         ) : null}
-        <div className="row">
-          <button type="button" disabled={busy} onClick={handleRecoverSession}>
-            Recover Session + Lobby
-          </button>
-        </div>
       </section>
 
       <section className="panel">
-        <h2>2) Email Recovery Path</h2>
-        <p className="panelHint">
-          Email-based recovery is part of the Day1 continuity path when Dynamic is unavailable.
-        </p>
-        <details>
-          <summary>Open legacy password recovery controls</summary>
-          <div className="row">
-            <input value={recoveryEmail} onChange={(event) => setRecoveryEmail(event.target.value)} placeholder="Recovery email" />
-            <button type="button" disabled={busy} onClick={handleRecoveryRequest}>
-              Request Recovery
-            </button>
-          </div>
-          <div className="row">
-            <input value={recoveryToken} onChange={(event) => setRecoveryToken(event.target.value)} placeholder="Reset token" />
-            <input
-              value={recoveryNewPassword}
-              onChange={(event) => setRecoveryNewPassword(event.target.value)}
-              placeholder="New password"
-              type="password"
-            />
-            <button type="button" disabled={busy || !recoveryToken.trim()} onClick={handleRecoveryReset}>
-              Reset Password
-            </button>
-          </div>
-        </details>
-      </section>
-
-      <section className="panel">
-        <h2>3) MFA + Device Controls</h2>
-        <p className="panelHint">TOTP enrollment and trusted-device/session scaffolding for account hardening.</p>
-        <div className="row">
-          <button type="button" disabled={busy || !backendSession} onClick={handleTotpEnrollStart}>
-            Start TOTP Enrollment
-          </button>
-          <input value={mfaCodeInput} onChange={(event) => setMfaCodeInput(event.target.value)} placeholder="6-digit TOTP" />
-          <button type="button" disabled={busy || !backendSession} onClick={handleTotpEnrollVerify}>
-            Verify Enrollment
-          </button>
-          <button type="button" disabled={busy || !backendSession} onClick={handleTotpDisable}>
-            Disable TOTP
-          </button>
-        </div>
-        <div className="row">
-          <button type="button" disabled={busy || !backendSession} onClick={handleTrustCurrentDevice}>
-            Trust This Device
-          </button>
-          <button type="button" disabled={busy || !backendSession} onClick={() => void withBusy(() => refreshSecurityPosture())}>
-            Refresh Security State
-          </button>
-        </div>
+        <h2>2) Security Telemetry</h2>
+        <p className="panelHint">Live security posture, trusted-device/session inventory, and current counters.</p>
         <small>MFA enabled: {profile?.mfaEnabled ? "yes" : "no"} | Pending secret: {mfaSecretPreview || "none"}</small>
         <div className="securityList">
           <strong>Trusted devices</strong>
@@ -2031,7 +2191,7 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>2) Account Card (Backend State)</h2>
+        <h2>3) Account Card (Backend State)</h2>
         {!isSignedIn ? (
           <p className="accountEmpty">Sign in above to load backend session and account details.</p>
         ) : (
@@ -2060,33 +2220,9 @@ function App() {
               <span>Conversion Target</span>
               <strong>{accountConversionSnapshot.targetType}</strong>
             </div>
-            <div className="row">
-              <button
-                type="button"
-                disabled={busy || !backendSession}
-                onClick={() => void withBusy(() => refreshProfile())}
-              >
-                Refresh Backend Account
-              </button>
-              <button type="button" disabled={busy || !backendSession} onClick={handleSignOut}>
-                Sign Out (Backend Session)
-              </button>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() =>
-                  {
-                    clearClientAuthBootstrap();
-                    resetSessionState("Local session state reset. Sign in again to create a new backend session.");
-                  }
-                }
-              >
-                Reset Local Session
-              </button>
-              <button type="button" disabled={busy || !backendSession} onClick={handleExportWalletBackup}>
-                Export Wallet Backup
-              </button>
-            </div>
+            <small className="backupHint">
+              Session/account actions are grouped in the Toolbox under Wallet / Session and Advanced / Diagnostics.
+            </small>
             <small className="backupHint">
               Export is client-side only and never posts backup payloads to the Day1 API.{" "}
               {exportVaultCandidate
@@ -2183,23 +2319,13 @@ function App() {
       </section>
 
       <section className="panel" ref={walletBindingSectionRef}>
-        <h2>3) Secure Wallet Setup</h2>
+        <h2>4) Secure Wallet Setup</h2>
         <p className="panelHint">
-          Create a managed wallet tied to your account identity, then store your recovery code securely.
+          Wallet setup actions are in the Toolbox. This panel shows secure-wallet status and recovery material.
         </p>
-        <div className="row">
-          <button type="button" disabled={busy || !backendSession} onClick={handleOpenCreateSecureWalletModal}>
-            Create Secure Wallet
-          </button>
-          <button
-            type="button"
-            disabled={busy || !backendSession || !profile?.walletAddress?.trim()}
-            onClick={handleSetupPasskey}
-          >
-            Set Up Passkey (Touch ID / Face ID)
-          </button>
-          <small>Uses Dynamic-backed identity plus Day1 account linkage for ownership continuity.</small>
-        </div>
+        <small className="backupHint">
+          Uses Dynamic-backed identity plus Day1 account linkage for ownership continuity.
+        </small>
         <small className="backupHint">
           Passkey support:{" "}
           {hasLocalPasskey
@@ -2238,11 +2364,17 @@ function App() {
           </small>
           <div className="row">
             <input
+              title="Recovery secret used to validate/import wallet linkage from encrypted backup material."
               value={recoverySecretInput}
               onChange={(event) => setRecoverySecretInput(event.target.value)}
               placeholder="Recovery secret code"
             />
-            <button type="button" disabled={busy || !backendSession || !recoverySecretInput.trim()} onClick={handleRecoverWalletFromSecret}>
+            <button
+              type="button"
+              title="Validate recovery secret and restore backend wallet linkage when recovery payload is present."
+              disabled={busy || !backendSession || !recoverySecretInput.trim()}
+              onClick={handleRecoverWalletFromSecret}
+            >
               Validate / Import Recovery
             </button>
           </div>
@@ -2260,27 +2392,13 @@ function App() {
             </p>
           ) : null}
         </div>
-        <details>
-          <summary>Advanced: link an existing wallet address</summary>
-          <div className="row">
-            <input
-              ref={walletAddressInputRef}
-              value={walletAddress}
-              onChange={(event) => setWalletAddress(event.target.value)}
-              placeholder="Existing wallet address"
-            />
-            <button type="button" disabled={busy || !backendSession} onClick={handleWalletBind}>
-              Link Existing Wallet
-            </button>
-          </div>
-        </details>
         <small>
           Secure wallet status: {profile?.walletStatus ?? "unknown"} {profile?.walletAddress ?? ""}
         </small>
       </section>
 
       <section className="panel">
-        <h2>4) Lobby (Create/Join/List)</h2>
+        <h2>5) Lobby (Create/Join/List)</h2>
         <div className="row">
           <select
             value={selectedGameType}
@@ -2386,7 +2504,7 @@ function App() {
       </div>
 
       <section className="panel">
-        <h2>5) Game Board (Server Authoritative)</h2>
+        <h2>6) Game Board (Server Authoritative)</h2>
         <p className="panelHint">
           Server enforces seat ownership, turn order, completion state, and reward confirmations.
         </p>
@@ -2421,7 +2539,7 @@ function App() {
       ) : null}
 
       <section className="panel">
-        <h2>6) Completion + Rewards</h2>
+        <h2>7) Completion + Rewards</h2>
         {postGameSummary ? (
           <div className="completionCard">
             <p>{postGameSummary}</p>
@@ -2438,7 +2556,7 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>7) Known Players + Leaderboard</h2>
+        <h2>8) Known Players + Leaderboard</h2>
         <div className="directoryGrid">
           <div>
             <h3>Recently Active Players</h3>
@@ -2476,7 +2594,7 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>8) On-Chain Intent Scaffold</h2>
+        <h2>9) On-Chain Intent Scaffold</h2>
         <div className="row">
           <button type="button" disabled={busy} onClick={handleRefreshRewards}>
             Get Rewards
@@ -2511,7 +2629,7 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>9) Periodic Ratification</h2>
+        <h2>10) Periodic Ratification</h2>
         <p className="panelHint">
           Off-chain events are bundled in deterministic batches and anchored by the server on a cadence.
         </p>
@@ -2584,7 +2702,7 @@ function App() {
       </section>
 
       <section className="panel truthPanel">
-        <h2>10) Truth Stack</h2>
+        <h2>11) Truth Stack</h2>
         <p className="panelHint">
           Stack view of no-wager records: pending off-chain work, ratified anchors, and on-chain gate sources.
         </p>

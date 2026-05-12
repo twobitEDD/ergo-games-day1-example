@@ -50,6 +50,40 @@ h1 {
   color: var(--color-text-muted);
 }
 
+.toolboxPanel {
+  border-width: 2px;
+}
+
+.toolboxGrid {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.toolboxGroup {
+  border: 1px solid var(--color-border-soft);
+  border-radius: 0.65rem;
+  padding: 0.6rem;
+  background: rgba(255, 255, 255, 0.74);
+}
+
+.toolboxGroup h3 {
+  margin: 0 0 0.45rem;
+  font-size: 0.93rem;
+}
+
+.toolboxAdvanced {
+  border: 1px dashed var(--color-border);
+  border-radius: 0.65rem;
+  padding: 0.45rem 0.55rem;
+  background: rgba(248, 250, 255, 0.75);
+}
+
+.toolboxAdvanced > summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
 .progressiveOnboarding {
   margin-bottom: 0.65rem;
   padding: 0.6rem;
