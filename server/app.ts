@@ -38,6 +38,7 @@ const REQUEST_ID_HEADER = "x-request-id";
 const CORRELATION_ID_HEADER = "x-correlation-id";
 const IDEMPOTENCY_HEADER = "idempotency-key";
 const SESSION_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 7;
+const SESSION_REUSE_MIN_TTL_MS = 1000 * 60 * 10;
 const IDEMPOTENCY_TTL_MS = 1000 * 60 * 60 * 12;
 const REGISTER_POLICY: RateLimitPolicy = { maxAttempts: 10, windowMs: 15 * 60 * 1000, blockMs: 15 * 60 * 1000 };
 const LOGIN_POLICY: RateLimitPolicy = { maxAttempts: 6, windowMs: 10 * 60 * 1000, blockMs: 10 * 60 * 1000 };
@@ -700,6 +701,29 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
         displayNameAtLink: displayName || undefined,
       });
     }
+    const existingAuth = resolveAuthIfPresent(req);
+    if (authMode !== "guest" && existingAuth?.session.userId === profile.userId) {
+      // Idempotent bridge behavior: reuse same still-fresh session for repeated identity sync calls.
+      const remainingTtlMs = Date.parse(existingAuth.session.expiresAt) - Date.now();
+      if (remainingTtlMs > SESSION_REUSE_MIN_TTL_MS) {
+        const csrfToken = store.rotateCsrfToken(existingAuth.session.sessionId);
+        if (csrfToken) {
+          writeSessionCookie(res, existingAuth.sessionToken);
+          logSecurityEvent(req, {
+            eventType: "AUTH_SYNC",
+            userId: profile.userId,
+            sessionId: existingAuth.session.sessionId,
+            outcome: "INFO",
+            metadata: { sessionReused: true },
+          });
+          return {
+            ...buildAuthSuccessPayload(existingAuth.session, profile, csrfToken, existingAuth.sessionToken),
+            authMode,
+            sessionReused: true,
+          };
+        }
+      }
+    }
     const { session, sessionToken, csrfToken } = store.createSessionForUser(profile.userId, {
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
@@ -1018,6 +1042,29 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
     if (!profile) {
       res.status(500).json({ error: "PROFILE_NOT_FOUND" });
       return;
+    }
+    if (currentAuth?.session.userId === userId) {
+      // Prevent churn: repeated Dynamic bridge calls from same authenticated identity reuse session.
+      const remainingTtlMs = Date.parse(currentAuth.session.expiresAt) - Date.now();
+      if (remainingTtlMs > SESSION_REUSE_MIN_TTL_MS) {
+        const csrfToken = store.rotateCsrfToken(currentAuth.session.sessionId);
+        if (csrfToken) {
+          writeSessionCookie(res, currentAuth.sessionToken);
+          logSecurityEvent(req, {
+            eventType: "AUTH_DYNAMIC_LOGIN",
+            userId,
+            sessionId: currentAuth.session.sessionId,
+            outcome: "INFO",
+            metadata: { emailVerified: claims.emailVerified, sessionReused: true },
+          });
+          res.json({
+            ...buildAuthSuccessPayload(currentAuth.session, profile, csrfToken, currentAuth.sessionToken),
+            authMode: "dynamic",
+            sessionReused: true,
+          });
+          return;
+        }
+      }
     }
     const { session, sessionToken, csrfToken } = store.createSessionForUser(userId, {
       ipAddress: req.ip,

@@ -74,7 +74,10 @@ import { deriveCompletionFromStatus } from "./game-hydration";
 import { useDay1Dynamic } from "./day1DynamicState";
 import {
   isDynamicConfigurationError,
+  isHardDynamicBridgeError,
   retryWithBoundedBackoff,
+  shouldRetryDynamicBridgeError,
+  shouldStartAutoBridgeAttempt,
   waitForAuthTokenWithRetry,
 } from "./dynamicSessionSync";
 import "./App.css";
@@ -92,9 +95,11 @@ const SESSION_VERIFY_RETRY_DELAY_MS = 220;
 const DYNAMIC_LOGIN_MAX_ATTEMPTS = 3;
 const DYNAMIC_LOGIN_RETRY_BASE_DELAY_MS = 250;
 const DYNAMIC_LOGIN_RETRY_MAX_DELAY_MS = 1400;
+// Auto-bridge guardrails: keep retries rare, bounded, and identity-scoped.
 const AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY = 3;
 const AUTO_BRIDGE_COOLDOWN_BASE_MS = 4000;
 const AUTO_BRIDGE_COOLDOWN_MAX_MS = 30000;
+const AUTO_BRIDGE_MIN_ATTEMPT_GAP_MS = 1500;
 const AUTO_BRIDGE_SUCCESS_MESSAGE_MS = 1500;
 const LazyDynamicWidget = lazy(() =>
   import("./DynamicWidgetSlot").then((module) => ({ default: module.DynamicWidgetSlot }))
@@ -486,6 +491,8 @@ function App() {
   const autoBridgeCooldownUntilRef = useRef(0);
   const autoBridgeIdentityRef = useRef<string | null>(null);
   const autoBridgeReadyRef = useRef(false);
+  const autoBridgeHardBlockedIdentityRef = useRef<string | null>(null);
+  const autoBridgeLastAttemptAtRef = useRef(0);
   const autoBridgeStatusTimerRef = useRef<number | null>(null);
 
   const gameStatus = useMemo(() => {
@@ -1136,7 +1143,7 @@ function App() {
             baseDelayMs: DYNAMIC_LOGIN_RETRY_BASE_DELAY_MS,
             maxDelayMs: DYNAMIC_LOGIN_RETRY_MAX_DELAY_MS,
             sleep,
-            shouldRetry: (error) => !isDynamicConfigurationError(error),
+            shouldRetry: shouldRetryDynamicBridgeError,
             onRetry: () => {
               setDynamicSyncStatusMessage(
                 source === "auto"
@@ -1205,6 +1212,7 @@ function App() {
               : `Dynamic linked via ${linkedMode === "jwt_verified" ? "JWT verified mode" : "compatibility mode"} for ${verifiedSession.profile.displayName}.`
           );
           if (source === "auto") {
+            autoBridgeHardBlockedIdentityRef.current = null;
             clearAutoSyncStatusSoon();
           }
           return true;
@@ -1217,6 +1225,9 @@ function App() {
           setDynamicSyncErrorMessage(message);
           setDynamicSyncStatusMessage(null);
           setEventLog(`Dynamic -> Day1 session failed: ${message}`);
+          if (source === "auto" && dynamicIdentityKey && isHardDynamicBridgeError(error)) {
+            autoBridgeHardBlockedIdentityRef.current = dynamicIdentityKey;
+          }
           return false;
         } finally {
           setDynamicSyncInProgress(false);
@@ -1229,7 +1240,7 @@ function App() {
       dynamicSyncInFlightRef.current = inFlight;
       return inFlight;
     },
-    [clearAutoSyncStatusSoon, dynamic, refreshPostLoginState, waitForDynamicAuthToken]
+    [clearAutoSyncStatusSoon, dynamic, dynamicIdentityKey, refreshPostLoginState, waitForDynamicAuthToken]
   );
 
   const handleDynamicLogin = (payload: { email?: string; displayName?: string }) => {
@@ -1245,25 +1256,33 @@ function App() {
       autoBridgeIdentityRef.current = dynamicIdentityKey;
       autoBridgeAttemptsRef.current = 0;
       autoBridgeCooldownUntilRef.current = 0;
-    }
-    if (!dynamicReady || !dynamicIdentityKey) {
-      return;
-    }
-    const shouldAttempt =
-      becameReady || identityChanged || !backendSession || Boolean(authBlockingReason) || dynamicAuthMode !== "jwt_verified";
-    if (!shouldAttempt) {
-      return;
-    }
-    if (dynamicSyncInFlightRef.current || dynamicSyncInProgress) {
-      return;
+      autoBridgeHardBlockedIdentityRef.current = null;
+      autoBridgeLastAttemptAtRef.current = 0;
     }
     const now = Date.now();
-    if (now < autoBridgeCooldownUntilRef.current) {
+    if (
+      !shouldStartAutoBridgeAttempt({
+        dynamicReady,
+        identityKey: dynamicIdentityKey,
+        identityChanged,
+        becameReady,
+        hasBackendSession: Boolean(backendSession),
+        hasAuthBlockingReason: Boolean(authBlockingReason),
+        authMode: dynamicAuthMode,
+        syncInFlight: Boolean(dynamicSyncInFlightRef.current),
+        syncInProgress: dynamicSyncInProgress,
+        nowMs: now,
+        cooldownUntilMs: autoBridgeCooldownUntilRef.current,
+        attemptsForIdentity: autoBridgeAttemptsRef.current,
+        maxAttemptsPerIdentity: AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY,
+        lastAttemptAtMs: autoBridgeLastAttemptAtRef.current,
+        minAttemptGapMs: AUTO_BRIDGE_MIN_ATTEMPT_GAP_MS,
+        hardBlockedIdentityKey: autoBridgeHardBlockedIdentityRef.current,
+      })
+    ) {
       return;
     }
-    if (autoBridgeAttemptsRef.current >= AUTO_BRIDGE_MAX_ATTEMPTS_PER_IDENTITY) {
-      return;
-    }
+    autoBridgeLastAttemptAtRef.current = now;
     void (async () => {
       const success = await performDynamicSessionSync({
         source: "auto",

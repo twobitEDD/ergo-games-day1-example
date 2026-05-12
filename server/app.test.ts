@@ -233,6 +233,39 @@ test("dynamic login links by email and creates a day1 session", async () => {
   }
 });
 
+test("repeated dynamic bridge calls reuse fresh session without churn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: async (token) => {
+      if (token !== "stable-dynamic-token") throw new Error("bad token");
+      return {
+        subject: "dyn_stable_subject",
+        email: "dynamic-stable@example.local",
+        emailVerified: true,
+        displayName: "Dynamic Stable",
+      };
+    },
+  });
+  const client = request.agent(app);
+  try {
+    const first = await client.post("/api/auth/dynamic/login").send({ authToken: "stable-dynamic-token" }).expect(200);
+    const firstSessionId = first.body.session.sessionId as string;
+    const userId = first.body.session.userId as string;
+    const second = await client.post("/api/auth/dynamic/login").send({ authToken: "stable-dynamic-token" }).expect(200);
+    assert.equal(second.body.session.sessionId, firstSessionId);
+    assert.equal(second.body.session.userId, userId);
+    assert.equal(second.body.sessionReused, true);
+    assert.equal(store.listSessionsForUser(userId).length, 1);
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dynamic login can load game types and create game", async () => {
   const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
   const dbPath = join(dir, "test.sqlite");
@@ -302,6 +335,46 @@ test("dynamic compatibility bootstrap keeps session usable when JWT verifier is 
 
     const csrfToken = (verifiedSession.body.csrfToken as string) || (compatibility.body.csrfToken as string);
     await withCsrf(client, csrfToken, "post")("/api/game/create").send({ gameType: "tic_tac_toe" }).expect(201);
+  } finally {
+    closeTestAgent(client);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repeated compatibility bridge calls keep one active session for same identity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "day1-tests-"));
+  const dbPath = join(dir, "test.sqlite");
+  const store = new Day1Store(dbPath);
+  const app = createDay1App(store, {
+    enableRatificationScheduler: false,
+    dynamicTokenVerifier: null,
+  });
+  const client = request.agent(app);
+  try {
+    const first = await client
+      .post("/api/auth/sync")
+      .send({
+        displayName: "Compatibility Stable",
+        email: "compat-stable@example.local",
+        externalAuthRef: "compat-stable-subject",
+      })
+      .expect(201);
+    const userId = first.body.session.userId as string;
+    const sessionId = first.body.session.sessionId as string;
+
+    const second = await client
+      .post("/api/auth/sync")
+      .send({
+        displayName: "Compatibility Stable",
+        email: "compat-stable@example.local",
+        externalAuthRef: "compat-stable-subject",
+      })
+      .expect(201);
+    assert.equal(second.body.session.userId, userId);
+    assert.equal(second.body.session.sessionId, sessionId);
+    assert.equal(second.body.sessionReused, true);
+    assert.equal(store.listSessionsForUser(userId).length, 1);
   } finally {
     closeTestAgent(client);
     store.close();
