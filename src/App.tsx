@@ -158,6 +158,15 @@ const toBase64 = (bytes: Uint8Array): string => {
   return window.btoa(binary);
 };
 
+const toBase64Url = (bytes: Uint8Array): string =>
+  toBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+const fromBase64Url = (value: string): Uint8Array => {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = window.atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+};
+
 const createRecoverySecretCode = (): string => {
   const random = new Uint8Array(20);
   crypto.getRandomValues(random);
@@ -266,6 +275,17 @@ interface DynamicLoginPanelProps {
   onSync: (payload: { email?: string; displayName?: string }) => void;
 }
 
+interface LocalPasskeyRecord {
+  credentialId: string;
+  rpId: string;
+  createdAt: string;
+  transports: string[];
+}
+
+type PasskeySetupState =
+  | { status: "idle"; message: null }
+  | { status: "success" | "unsupported" | "skipped" | "error"; message: string };
+
 const DynamicLoginPanel = ({
   busy,
   isSignedIn,
@@ -364,6 +384,9 @@ function App() {
   const [latestRecoverySecret, setLatestRecoverySecret] = useState<string | null>(null);
   const [latestRecoveryIssuedAt, setLatestRecoveryIssuedAt] = useState<string | null>(null);
   const [lastBackupExportAt, setLastBackupExportAt] = useState<string | null>(null);
+  const [isSecureWalletModalOpen, setIsSecureWalletModalOpen] = useState(false);
+  const [secureWalletConfirmationChecked, setSecureWalletConfirmationChecked] = useState(false);
+  const [passkeySetupState, setPasskeySetupState] = useState<PasskeySetupState>({ status: "idle", message: null });
   const [busy, setBusy] = useState(false);
   const [lobbyFilter, setLobbyFilter] = useState<"all" | "open" | "active" | "completed">("all");
   const [gameTypesLoadState, setGameTypesLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
@@ -1092,6 +1115,136 @@ function App() {
     });
   };
 
+  const handleOpenCreateSecureWalletModal = () => {
+    if (!backendSession) {
+      setEventLog("Sign in first to complete account security setup.");
+      return;
+    }
+    if (!dynamic.user && dynamicAuthMode !== "jwt_verified") {
+      setEventLog("Complete Dynamic sign-in first, then create your secure wallet.");
+      return;
+    }
+    setSecureWalletConfirmationChecked(false);
+    setIsSecureWalletModalOpen(true);
+  };
+
+  const registerLocalPasskey = async (
+    accountUserId: string,
+    accountEmail?: string
+  ): Promise<{
+    status: "success" | "unsupported" | "skipped" | "error";
+    message: string;
+    passkeyRecord?: LocalPasskeyRecord;
+  }> => {
+    if (typeof window === "undefined" || typeof navigator === "undefined") {
+      return {
+        status: "unsupported",
+        message: "Passkey setup is only available in a browser. Wallet setup completed without passkey.",
+      };
+    }
+    if (!window.isSecureContext) {
+      return {
+        status: "unsupported",
+        message: "Passkeys require HTTPS or localhost. Wallet is ready; set up a passkey later in a secure context.",
+      };
+    }
+    if (!("PublicKeyCredential" in window) || !navigator.credentials?.create) {
+      return {
+        status: "unsupported",
+        message: "This browser does not support passkeys. Wallet is ready; add a passkey later on a supported device.",
+      };
+    }
+
+    const hasPlatformAuthenticator = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.();
+    if (hasPlatformAuthenticator === false) {
+      return {
+        status: "unsupported",
+        message: "No compatible device authenticator was detected. Wallet is ready; add a passkey later.",
+      };
+    }
+
+    const existingCredentialId =
+      exportVaultCandidate?.record.passkey &&
+      typeof exportVaultCandidate.record.passkey === "object" &&
+      typeof (exportVaultCandidate.record.passkey as { credentialId?: unknown }).credentialId === "string"
+        ? (exportVaultCandidate.record.passkey as { credentialId: string }).credentialId
+        : null;
+    const excludeCredentials = existingCredentialId
+      ? [
+          {
+            id: fromBase64Url(existingCredentialId),
+            type: "public-key" as const,
+          },
+        ]
+      : undefined;
+
+    try {
+      const createdCredential = (await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: {
+            id: window.location.hostname,
+            name: "Ergo Games Day1",
+          },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(32)),
+            name: accountEmail ?? `day1-${accountUserId}`,
+            displayName: profile?.displayName ?? "Day1 Player",
+          },
+          pubKeyCredParams: [
+            { type: "public-key", alg: -7 },
+            { type: "public-key", alg: -257 },
+          ],
+          timeout: 60000,
+          attestation: "none",
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            userVerification: "preferred",
+            residentKey: "preferred",
+          },
+          excludeCredentials,
+        },
+      })) as PublicKeyCredential | null;
+
+      if (!createdCredential) {
+        return {
+          status: "error",
+          message: "Passkey registration did not complete. Wallet is still ready.",
+        };
+      }
+
+      const response = createdCredential.response as AuthenticatorAttestationResponse;
+      const transports =
+        typeof response.getTransports === "function"
+          ? response.getTransports().filter((entry): entry is string => typeof entry === "string")
+          : [];
+
+      return {
+        status: "success",
+        message: "Secure wallet created and local passkey registered on this device.",
+        passkeyRecord: {
+          credentialId: toBase64Url(new Uint8Array(createdCredential.rawId)),
+          rpId: window.location.hostname,
+          createdAt: new Date().toISOString(),
+          transports,
+        },
+      };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotAllowedError") {
+        return {
+          status: "skipped",
+          message:
+            "Wallet created. Passkey setup was skipped or canceled; you can add one later from a passkey-capable device.",
+        };
+      }
+      const detail = error instanceof Error ? error.message : "Unknown passkey setup error";
+      return {
+        status: "error",
+        message: `Wallet created, but passkey setup failed (${detail}). You can retry later.`,
+      };
+    }
+  };
+
   const handleCreateSecureWallet = () => {
     if (!backendSession) {
       setEventLog("Sign in first to complete account security setup.");
@@ -1101,6 +1254,11 @@ function App() {
       setEventLog("Complete Dynamic sign-in first, then create your secure wallet.");
       return;
     }
+    if (!secureWalletConfirmationChecked) {
+      setEventLog("Confirm the secure wallet warning before continuing.");
+      return;
+    }
+    setIsSecureWalletModalOpen(false);
     void withBusy(async () => {
       const now = Date.now();
       const walletAddressToLink =
@@ -1129,12 +1287,25 @@ function App() {
           ? { profile }
           : await apiBindWallet(walletAddressToLink);
       const capabilityEnvelope = await apiGetCapabilities();
+      const passkeyResult = await registerLocalPasskey(backendSession.userId, profile?.email);
+      if (passkeyResult.status === "success" && passkeyResult.passkeyRecord) {
+        const recordToPersist: EncryptedVaultRecord = {
+          ...vaultRecord,
+          passkey: passkeyResult.passkeyRecord,
+        };
+        window.localStorage.setItem(ENCRYPTED_VAULT_LOCAL_STORAGE_KEY, JSON.stringify(recordToPersist));
+      }
       setProfile(payload.profile);
       setWalletAddress(walletAddressToLink);
       setSessionCapabilities(capabilityEnvelope.capabilities);
       setLatestRecoverySecret(recoverySecretCode);
       setLatestRecoveryIssuedAt(new Date(now).toLocaleString());
-      setEventLog("Secure wallet created. Save your recovery code now to enable future export/recovery.");
+      setPasskeySetupState({ status: passkeyResult.status, message: passkeyResult.message });
+      setEventLog(
+        passkeyResult.status === "success"
+          ? "Layer 2 unlocked: secure wallet + local passkey protected."
+          : `Layer 2 unlocked: secure wallet created. ${passkeyResult.message}`
+      );
     });
   };
 
@@ -1787,11 +1958,23 @@ function App() {
           Create a managed wallet tied to your account identity, then store your recovery code securely.
         </p>
         <div className="row">
-          <button type="button" disabled={busy || !backendSession} onClick={handleCreateSecureWallet}>
+          <button type="button" disabled={busy || !backendSession} onClick={handleOpenCreateSecureWalletModal}>
             Create Secure Wallet
           </button>
           <small>Uses Dynamic-backed identity plus Day1 account linkage for ownership continuity.</small>
         </div>
+        {passkeySetupState.status !== "idle" ? (
+          <p
+            className={`dynamicStatus ${
+              passkeySetupState.status === "success" ? "dynamicStatus--ready" : "dynamicStatus--initializing"
+            }`}
+          >
+            {passkeySetupState.message}
+            {passkeySetupState.status !== "success"
+              ? " TODO: persist passkey registration server-side when a backend endpoint is available."
+              : ""}
+          </p>
+        ) : null}
         {latestRecoverySecret ? (
           <div className="securityList">
             <strong>Recovery secret code (save offline now)</strong>
@@ -2176,6 +2359,60 @@ function App() {
           ))}
         </div>
       </section>
+
+      {isSecureWalletModalOpen ? (
+        <div
+          className="secureWalletModalBackdrop"
+          role="presentation"
+          onClick={() => {
+            setIsSecureWalletModalOpen(false);
+            setSecureWalletConfirmationChecked(false);
+          }}
+        >
+          <div
+            className="secureWalletModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="secure-wallet-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="secure-wallet-modal-title">Confirm secure wallet creation</h3>
+            <p>
+              This creates a secure wallet tied to your account security and ownership. It is a serious action that enables
+              Layer 2 rewards access.
+            </p>
+            <ul>
+              <li>You will receive a recovery secret code that you must store safely.</li>
+              <li>Future access/recovery/export uses your account session plus that recovery code.</li>
+              <li>Anyone with your recovery code may be able to recover/export wallet data.</li>
+            </ul>
+            <p>Store the recovery code offline (for example in a password manager or paper backup).</p>
+            <label className="secureWalletConfirmLabel">
+              <input
+                type="checkbox"
+                checked={secureWalletConfirmationChecked}
+                onChange={(event) => setSecureWalletConfirmationChecked(event.target.checked)}
+              />
+              I understand this action and will store my recovery code safely offline.
+            </label>
+            <div className="row secureWalletModalActions">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setIsSecureWalletModalOpen(false);
+                  setSecureWalletConfirmationChecked(false);
+                }}
+              >
+                Not now
+              </button>
+              <button type="button" disabled={busy || !secureWalletConfirmationChecked} onClick={handleCreateSecureWallet}>
+                Continue and Create Wallet
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <pre className="eventBox">{eventLog}</pre>
     </main>
