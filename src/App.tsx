@@ -19,6 +19,7 @@ import {
   apiBindWallet,
   apiCreateGame,
   apiCreateOnChainIntent,
+  apiCreateVrfTestRequest,
   apiGetRatificationSchedule,
   apiSetRatificationSchedule,
   apiRunRatification,
@@ -28,6 +29,7 @@ import {
   apiGetServerWalletStatus,
   apiGetGame,
   apiGetIntentStatus,
+  apiGetVrfTestRequestStatus,
   apiJoinGame,
   apiListGames,
   apiListGameTypes,
@@ -51,6 +53,8 @@ import {
   apiListSessions,
   apiRevokeSession,
   apiGetSecurityMetrics,
+  apiListVrfTestRequests,
+  apiSyncVrfTestRequest,
   clearClientAuthBootstrap,
   type ApiGame,
   type ApiSession,
@@ -70,6 +74,7 @@ import {
   type ApiRatificationAdapterInfo,
   type ApiTruthStack,
   type ApiTruthStackItem,
+  type ApiVrfRequest,
 } from "./api";
 import { deriveCompletionFromStatus } from "./game-hydration";
 import { useDay1Dynamic } from "./day1DynamicState";
@@ -125,6 +130,21 @@ type ExportVaultSource = "local-storage" | "dynamic-metadata";
 interface ExportVaultCandidate {
   source: ExportVaultSource;
   record: EncryptedVaultRecord;
+}
+
+interface NautilusApi {
+  get_change_address: () => Promise<string>;
+}
+
+interface NautilusConnectorApi {
+  nautilus?: {
+    connect: () => Promise<boolean>;
+  };
+}
+
+interface NautilusWindow extends Window {
+  ergo?: NautilusApi;
+  ergoConnector?: NautilusConnectorApi;
 }
 
 const isEncryptedVaultRecord = (value: unknown): value is EncryptedVaultRecord => {
@@ -312,6 +332,15 @@ const toOnboardingStatusCopy = (status: OnboardingStepStatus) => {
   return "Not started";
 };
 
+const toOnboardingActionCopy = (action: OnboardingStepAction) => {
+  if (action === "dynamic_sync") return "Connect Day1 Session";
+  if (action === "create_wallet") return "Secure Wallet Setup";
+  if (action === "save_recovery") return "Save Recovery Secret";
+  if (action === "setup_passkey") return "Set Up Passkey";
+  if (action === "start_example_game") return "Start Example Game";
+  return "Continue";
+};
+
 const FALLBACK_GAME_TYPES: GameTypeMetadata[] = [
   {
     gameType: "tic_tac_toe",
@@ -450,6 +479,11 @@ function App() {
   const [joinGameId, setJoinGameId] = useState("");
   const [rewards, setRewards] = useState<ApiRewardSnapshot | null>(null);
   const [intentId, setIntentId] = useState("");
+  const [vrfRequestId, setVrfRequestId] = useState("");
+  const [vrfContractRef, setVrfContractRef] = useState("day1-contract:tic_tac_toe");
+  const [vrfMaxSubmissions, setVrfMaxSubmissions] = useState("2");
+  const [vrfRequestStatus, setVrfRequestStatus] = useState<ApiVrfRequest | null>(null);
+  const [vrfRecentRequests, setVrfRecentRequests] = useState<ApiVrfRequest[]>([]);
   const [transferIntents] = useState<AccountTransferIntent[]>([]);
   const [recoveryEmail, setRecoveryEmail] = useState("player@example.local");
   const [localAuthDisplayName, setLocalAuthDisplayName] = useState("Local Player");
@@ -697,6 +731,25 @@ function App() {
   );
   const easyModeStatus = onboardingProgress.fullyComplete ? "Ready" : "Needs one action";
   const easyModePrimaryStep = onboardingProgress.steps[onboardingProgress.firstActionableIndex] ?? onboardingProgress.steps[0];
+  const easyModePrimaryActionLabel = onboardingProgress.fullyComplete
+    ? "Continue Playing"
+    : easyModePrimaryStep
+      ? toOnboardingActionCopy(easyModePrimaryStep.action)
+      : "Continue";
+  const linkedWalletAddress = accountSecurityState?.wallet.address?.trim() ?? profile?.walletAddress?.trim() ?? "";
+  const walletLinkedToSession = Boolean(
+    (accountSecurityState?.wallet.linked ?? profile?.walletStatus === "bound_stub") && linkedWalletAddress
+  );
+  const nautilusDetected =
+    typeof window !== "undefined" &&
+    Boolean((window as NautilusWindow).ergoConnector?.nautilus || (window as NautilusWindow).ergo);
+  const easyModeStateLabel = !backendSession
+    ? "Sign in to create your Day1 session."
+    : !walletLinkedToSession
+      ? "Secure your account by creating a wallet or linking Nautilus."
+      : onboardingProgress.fullyComplete
+        ? "Your Day1 session and wallet are ready."
+        : "Finish the highlighted onboarding step.";
   const transferIntentReadModel = useMemo(
     () => deriveTransferIntentReadModel(transferIntents),
     [transferIntents]
@@ -837,6 +890,9 @@ function App() {
     setGameStatusFromServer(null);
     setCompletion(null);
     setJoinGameId("");
+    setVrfRequestId("");
+    setVrfRequestStatus(null);
+    setVrfRecentRequests([]);
     setRewards(null);
     setIntentId("");
     setTrustedDevices([]);
@@ -978,12 +1034,22 @@ function App() {
     setTruthStack(truthPayload.truth);
   }, []);
 
+  const refreshVrfState = useCallback(async () => {
+    const requestsPayload = await apiListVrfTestRequests(10);
+    setVrfRecentRequests(requestsPayload.requests);
+    if (vrfRequestId) {
+      const activePayload = await apiGetVrfTestRequestStatus(vrfRequestId);
+      setVrfRequestStatus(activePayload.request);
+    }
+  }, [vrfRequestId]);
+
   const refreshPostLoginState = async () => {
-    const [lobbyResult, securityResult, ratificationResult, accountSecurityResult] = await Promise.allSettled([
+    const [lobbyResult, securityResult, ratificationResult, accountSecurityResult, vrfResult] = await Promise.allSettled([
       refreshLobbyAndDirectory(),
       refreshSecurityPosture(),
       refreshRatificationState(),
       refreshAccountSecurityState(),
+      refreshVrfState(),
     ]);
     if (lobbyResult.status === "rejected") {
       if (isTransientSessionHydrationError(lobbyResult.reason)) {
@@ -994,7 +1060,7 @@ function App() {
       }
       throw lobbyResult.reason;
     }
-    const nonBlockingFailures = [securityResult, ratificationResult, accountSecurityResult].filter(
+    const nonBlockingFailures = [securityResult, ratificationResult, accountSecurityResult, vrfResult].filter(
       (result): result is PromiseRejectedResult => result.status === "rejected"
     );
     return { partialFailures: nonBlockingFailures.length > 0 };
@@ -1485,16 +1551,69 @@ function App() {
 
   const handleWalletBind = () => {
     if (!backendSession) {
-      setEventLog("Create session first.");
+      setEventLog("Connect a Day1 session first, then link a wallet.");
+      return;
+    }
+    const normalizedWalletAddress = walletAddress.trim();
+    if (!normalizedWalletAddress) {
+      setEventLog("Enter an Ergo wallet address first.");
+      walletAddressInputRef.current?.focus();
+      return;
+    }
+    if (linkedWalletAddress && linkedWalletAddress === normalizedWalletAddress) {
+      setEventLog(`Wallet ${normalizedWalletAddress} is already linked to this Day1 session.`);
       return;
     }
     void withBusy(async () => {
-      const payload = await apiBindWallet(walletAddress);
+      const payload = await apiBindWallet(normalizedWalletAddress);
+      const capabilityEnvelope = await apiGetCapabilities();
+      setProfile(payload.profile);
+      setWalletAddress(normalizedWalletAddress);
+      setSessionCapabilities(capabilityEnvelope.capabilities);
+      await refreshAccountSecurityState();
+      setEventLog(`Wallet linked: ${normalizedWalletAddress}. Security and rewards paths are now unlocked.`);
+    });
+  };
+
+  const handleNautilusConnectAndBind = () => {
+    if (!backendSession) {
+      setEventLog("Connect a Day1 session first, then run Nautilus connect + bind.");
+      return;
+    }
+    void withBusy(async () => {
+      const browserWindow = window as NautilusWindow;
+      const connector = browserWindow.ergoConnector?.nautilus;
+      if (!connector) {
+        setEventLog("Nautilus extension was not detected. Install it, reload, then run connect + bind again.");
+        return;
+      }
+      const granted = await connector.connect();
+      if (!granted) {
+        setEventLog("Nautilus connection request was canceled. Approve it in the extension to continue.");
+        return;
+      }
+      const ergoApi = (window as NautilusWindow).ergo;
+      if (!ergoApi) {
+        setEventLog("Nautilus connected but EIP-12 API is unavailable. Reload and retry connect + bind.");
+        return;
+      }
+      const changeAddress = (await ergoApi.get_change_address()).trim();
+      if (!changeAddress) {
+        setEventLog("Nautilus returned an empty change address. Unlock Nautilus and retry.");
+        return;
+      }
+      setWalletAddress(changeAddress);
+      if (linkedWalletAddress && linkedWalletAddress === changeAddress) {
+        await refreshAccountSecurityState();
+        setEventLog(`Nautilus is connected. Wallet ${changeAddress} is already linked.`);
+        return;
+      }
+      const payload = await apiBindWallet(changeAddress);
       const capabilityEnvelope = await apiGetCapabilities();
       setProfile(payload.profile);
       setSessionCapabilities(capabilityEnvelope.capabilities);
       await refreshAccountSecurityState();
-      setEventLog("Layer 2 unlocked: ownership setup linked for rewards.");
+      setEventLog(`Nautilus connected and wallet linked: ${changeAddress}.`);
     });
   };
 
@@ -1807,6 +1926,14 @@ function App() {
     handleCreateGame();
   };
 
+  const handleQuickSessionReconnect = () => {
+    if (dynamic.enabled && dynamic.user) {
+      handleDynamicLogin({ email: dynamicEmail, displayName: dynamicDisplayName || undefined });
+      return;
+    }
+    handleRecoverSession();
+  };
+
   const handleOnboardingStepAction = (action: OnboardingStepAction) => {
     if (action === "dynamic_sync") {
       handleDynamicLogin({ email: dynamicEmail, displayName: dynamicDisplayName || undefined });
@@ -2096,6 +2223,62 @@ function App() {
     });
   };
 
+  const handleCreateVrfTest = () => {
+    if (!backendSession) {
+      setEventLog("Create session first.");
+      return;
+    }
+    void withBusy(async () => {
+      const requested = await apiCreateVrfTestRequest({
+        gameId: game?.gameId,
+        contractRef: vrfContractRef.trim() || undefined,
+        maxSubmissions: Number.isFinite(Number(vrfMaxSubmissions))
+          ? Math.max(1, Math.floor(Number(vrfMaxSubmissions)))
+          : undefined,
+      });
+      setVrfRequestId(requested.request.requestId);
+      setVrfRequestStatus(requested.request);
+      await refreshVrfState();
+      setEventLog(
+        `VRF requested id=${requested.request.requestId} round=${requested.request.roundId} mode=${requested.request.adapterMode}`
+      );
+    });
+  };
+
+  const handleSyncVrfRequest = () => {
+    if (!backendSession || !vrfRequestId.trim()) {
+      setEventLog("Create a VRF request first.");
+      return;
+    }
+    void withBusy(async () => {
+      const payload = await apiSyncVrfTestRequest(vrfRequestId.trim());
+      setVrfRequestStatus(payload.request);
+      await refreshVrfState();
+      setEventLog(
+        payload.request.status === "finalized" && payload.request.seedHex
+          ? `VRF finalized seed=${payload.request.seedHex}`
+          : `VRF status=${payload.request.status} submissions=${payload.request.submissionsCount}/${payload.request.maxSubmissions}`
+      );
+    });
+  };
+
+  const handleRefreshVrfRequest = () => {
+    if (!backendSession || !vrfRequestId.trim()) {
+      setEventLog("Create a VRF request first.");
+      return;
+    }
+    void withBusy(async () => {
+      const payload = await apiGetVrfTestRequestStatus(vrfRequestId.trim());
+      setVrfRequestStatus(payload.request);
+      await refreshVrfState();
+      setEventLog(
+        payload.request.status === "finalized" && payload.request.seedHex
+          ? `VRF seed=${payload.request.seedHex}`
+          : `VRF status=${payload.request.status} submissions=${payload.request.submissionsCount}/${payload.request.maxSubmissions}`
+      );
+    });
+  };
+
   const handleRatificationRun = () => {
     if (!backendSession) {
       setEventLog("Create session first.");
@@ -2242,11 +2425,30 @@ function App() {
               ? "Ready. Continue playing now."
               : `Needs one action: ${easyModePrimaryStep?.title ?? "Complete setup"}.`}
           </p>
+          <p className="quickStateLabel">{easyModeStateLabel}</p>
           <div className="row onboardingActionRow">
             <button type="button" disabled={busy} onClick={handleEasyModeContinue}>
-              Continue Playing
+              {easyModePrimaryActionLabel}
+            </button>
+            <button type="button" disabled={busy} onClick={handleQuickSessionReconnect}>
+              Reconnect Session + Lobby
+            </button>
+            <button
+              type="button"
+              disabled={busy || !backendSession || !nautilusDetected}
+              onClick={handleNautilusConnectAndBind}
+              title={
+                nautilusDetected
+                  ? "Connect Nautilus and link its change address in one action."
+                  : "Install Nautilus to enable one-click connect + bind."
+              }
+            >
+              Connect + Link Nautilus
             </button>
           </div>
+          {!nautilusDetected ? (
+            <small>Nautilus not detected in this browser. Install extension + reload to enable quick bind.</small>
+          ) : null}
           <small>
             {onboardingProgress.completedCount}/{onboardingProgress.totalCount} setup checks complete ({onboardingCompletionPercent}
             %)
@@ -2502,15 +2704,23 @@ function App() {
                   title="Existing wallet address to attach instead of creating a managed wallet."
                   value={walletAddress}
                   onChange={(event) => setWalletAddress(event.target.value)}
-                  placeholder="Existing wallet address"
+                  placeholder="Existing Ergo wallet address (9...)"
                 />
                 <button
                   type="button"
                   title="Link an externally-managed wallet address to the current Day1 account."
-                  disabled={busy || !backendSession}
+                  disabled={busy || !backendSession || !walletAddress.trim()}
                   onClick={handleWalletBind}
                 >
                   Link Existing Wallet
+                </button>
+                <button
+                  type="button"
+                  title="Open Nautilus, request EIP-12 connect, and link the returned change address to this Day1 session."
+                  disabled={busy || !backendSession || !nautilusDetected}
+                  onClick={handleNautilusConnectAndBind}
+                >
+                  Nautilus Connect + Link
                 </button>
                 <button
                   type="button"
@@ -2532,6 +2742,12 @@ function App() {
                   Reset Local Session
                 </button>
               </div>
+              <small className="quickStateLabel">
+                Wallet link state: {walletLinkedToSession ? `linked (${linkedWalletAddress})` : "not linked yet"}.
+                {walletLinkedToSession
+                  ? " You can reconnect Nautilus anytime without rebinding."
+                  : " Use existing address input or Nautilus Connect + Link to finish this step."}
+              </small>
             </div>
           </div>
         </details>
@@ -3061,7 +3277,59 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>10) Periodic Ratification</h2>
+        <h2>10) VRF Test Adapter</h2>
+        <p className="panelHint">
+          Request randomness for a Day1 contract reference, then sync until a finalized seed is returned.
+        </p>
+        <div className="row">
+          <input
+            value={vrfContractRef}
+            onChange={(event) => setVrfContractRef(event.target.value)}
+            placeholder="Contract reference (e.g. day1-contract:tic_tac_toe)"
+          />
+          <input
+            value={vrfMaxSubmissions}
+            onChange={(event) => setVrfMaxSubmissions(event.target.value)}
+            placeholder="Max submissions"
+          />
+        </div>
+        <div className="row">
+          <button type="button" disabled={busy || !backendSession} onClick={handleCreateVrfTest}>
+            Request VRF
+          </button>
+          <button type="button" disabled={busy || !backendSession || !vrfRequestId} onClick={handleSyncVrfRequest}>
+            Sync / Finalize
+          </button>
+          <button type="button" disabled={busy || !backendSession || !vrfRequestId} onClick={handleRefreshVrfRequest}>
+            Refresh VRF
+          </button>
+        </div>
+        <small>
+          Active request: {vrfRequestId || "none"} | Status: {vrfRequestStatus?.status ?? "n/a"} | Adapter:{" "}
+          {vrfRequestStatus?.adapterMode ?? "n/a"} | Round: {vrfRequestStatus?.roundId ?? "n/a"} | Submissions:{" "}
+          {vrfRequestStatus ? `${vrfRequestStatus.submissionsCount}/${vrfRequestStatus.maxSubmissions}` : "n/a"} | Seed:{" "}
+          {vrfRequestStatus?.seedHex ?? "pending"}
+        </small>
+        <div className="gameList">
+          {vrfRecentRequests.length === 0 ? (
+            <small>No VRF requests yet.</small>
+          ) : (
+            vrfRecentRequests.map((requestItem) => (
+              <div className="gameListRow" key={requestItem.requestId}>
+                <code>{requestItem.requestId}</code>
+                <span>{requestItem.status}</span>
+                <span>
+                  round={requestItem.roundId} submissions={requestItem.submissionsCount}/{requestItem.maxSubmissions}
+                </span>
+                <span>{requestItem.seedHex ? requestItem.seedHex.slice(0, 12) : "seed pending"}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>11) Periodic Ratification</h2>
         <p className="panelHint">
           Off-chain events are bundled in deterministic batches and anchored by the server on a cadence.
         </p>
@@ -3134,7 +3402,7 @@ function App() {
       </section>
 
       <section className="panel truthPanel">
-        <h2>11) Truth Stack</h2>
+        <h2>12) Truth Stack</h2>
         <p className="panelHint">
           Stack view of no-wager records: pending off-chain work, ratified anchors, and on-chain gate sources.
         </p>

@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import request from "supertest";
-import { GAME_TYPES, statusOf } from "@twobitedd/ergo-games-interface";
+import { statusOf } from "@twobitedd/ergo-games-interface";
 import { createDay1App } from "./app";
+import { listGameMetadata } from "./runtime/registry";
 import { Day1Store } from "./store";
 
 const createTestContext = () => {
@@ -455,7 +456,10 @@ test("dynamic session game-types response stays aligned with shared GameType con
       .expect(200);
     const response = await client.get("/api/game-types").expect(200);
     const ids = (response.body.gameTypes as Array<{ gameType: string }>).map((entry) => entry.gameType).sort();
-    assert.deepEqual(ids, [...GAME_TYPES].sort());
+    const expectedIds = listGameMetadata()
+      .map((entry) => entry.gameType)
+      .sort();
+    assert.deepEqual(ids, expectedIds);
   } finally {
     closeTestAgent(client);
     store.close();
@@ -1400,6 +1404,49 @@ test("truth stack endpoint classifies pending, ratified, and on-chain source rec
     }
   } finally {
     closeTestAgent(guestClient);
+    cleanup();
+  }
+});
+
+test("vrf test endpoints create and finalize deterministic seed in mock mode", async () => {
+  const previousMode = process.env.DAY1_VRF_ADAPTER_MODE;
+  const previousOracleUrl = process.env.DAY1_VRF_ORACLE_URL;
+  process.env.DAY1_VRF_ADAPTER_MODE = "mock";
+  delete process.env.DAY1_VRF_ORACLE_URL;
+  const { client, cleanup } = createTestContext();
+  try {
+    const identity = await registerAndLogin(client, {
+      displayName: "VRF Tester",
+      email: "vrf-tester@example.local",
+      password: "vrf-pass-123",
+    });
+    const postWithCsrf = withCsrf(client, identity.csrfToken, "post");
+    const created = await postWithCsrf("/api/vrf/test/request")
+      .send({ gameId: "game-abc", contractRef: "day1-contract:tic_tac_toe", maxSubmissions: 2 })
+      .expect(201);
+    assert.equal(created.body.request.status, "finalized");
+    assert.equal(created.body.request.adapterMode, "mock");
+    assert.match(created.body.request.seedHex as string, /^[a-f0-9]{64}$/);
+    const requestId = created.body.request.requestId as string;
+
+    const status = await client.get(`/api/vrf/test/request/${requestId}/status`).expect(200);
+    assert.equal(status.body.request.requestId, requestId);
+    assert.equal(status.body.request.status, "finalized");
+
+    const listed = await client.get("/api/vrf/test/requests?limit=5").expect(200);
+    assert.ok(Array.isArray(listed.body.requests));
+    assert.ok((listed.body.requests as Array<{ requestId: string }>).some((entry) => entry.requestId === requestId));
+  } finally {
+    if (previousMode === undefined) {
+      delete process.env.DAY1_VRF_ADAPTER_MODE;
+    } else {
+      process.env.DAY1_VRF_ADAPTER_MODE = previousMode;
+    }
+    if (previousOracleUrl === undefined) {
+      delete process.env.DAY1_VRF_ORACLE_URL;
+    } else {
+      process.env.DAY1_VRF_ORACLE_URL = previousOracleUrl;
+    }
     cleanup();
   }
 });

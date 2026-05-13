@@ -104,6 +104,21 @@ interface ApiIntent {
   txHash?: string;
 }
 
+export interface ApiVrfRequest {
+  requestId: string;
+  roundId: string;
+  gameId?: string;
+  contractRef?: string;
+  status: "requested" | "awaiting_submissions" | "finalized" | "error";
+  requestedAt: string;
+  updatedAt: string;
+  maxSubmissions: number;
+  submissionsCount: number;
+  seedHex?: string;
+  error?: string;
+  adapterMode: "mock" | "http_oracle";
+}
+
 export interface ApiServerWalletStatus {
   mode: "simulated" | "ergo";
   network: "testnet" | "mainnet";
@@ -587,6 +602,40 @@ export const apiGetIntentStatus = (intentId: string) =>
   fetchJson<{ scaffold: true; intent: ApiIntent }>(
     `/api/onchain/intent/${intentId}/status`,
     { method: "GET" }
+  );
+
+export const apiCreateVrfTestRequest = (
+  payload: { gameId?: string; contractRef?: string; maxSubmissions?: number },
+  sessionToken?: string
+) =>
+  fetchJson<{ scaffold: true; request: ApiVrfRequest; note: string }>(
+    "/api/vrf/test/request",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    sessionToken
+  );
+
+export const apiSyncVrfTestRequest = (requestId: string, sessionToken?: string) =>
+  fetchJson<{ scaffold: true; request: ApiVrfRequest }>(
+    `/api/vrf/test/request/${requestId}/sync`,
+    { method: "POST", body: JSON.stringify({}) },
+    sessionToken
+  );
+
+export const apiGetVrfTestRequestStatus = (requestId: string, sessionToken?: string) =>
+  fetchJson<{ scaffold: true; request: ApiVrfRequest }>(
+    `/api/vrf/test/request/${requestId}/status`,
+    { method: "GET" },
+    sessionToken
+  );
+
+export const apiListVrfTestRequests = (limit = 20, sessionToken?: string) =>
+  fetchJson<{ scaffold: true; requests: ApiVrfRequest[]; adapterMode: "mock" | "http_oracle" }>(
+    `/api/vrf/test/requests?limit=${limit}`,
+    { method: "GET" },
+    sessionToken
   );
 
 export const apiGetServerWalletStatus = (sessionToken?: string) =>

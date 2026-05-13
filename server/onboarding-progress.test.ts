@@ -90,3 +90,25 @@ test("deriveOnboardingProgress starts at account connection when session missing
   assert.equal(model.steps[1].status, "pending");
   assert.equal(model.firstActionableIndex, 0);
 });
+
+test("deriveOnboardingProgress exposes clear account and wallet action labels", () => {
+  const model = deriveOnboardingProgress({
+    hasDynamicIdentity: true,
+    hasBackendSession: false,
+    walletLinked: false,
+    walletAddress: null,
+    hasRecoveryMaterial: false,
+    passkeySupported: true,
+    passkeyConfigured: false,
+    hasExampleGame: false,
+    capabilities: buildProgressiveAccountCapabilities({
+      sessionActive: false,
+      walletBound: false,
+      rewardsWalletRequirement: "required",
+      wageringWalletRequirement: "required",
+    }),
+  });
+
+  assert.equal(model.steps[0].actionLabel, "Reconnect Day1 session");
+  assert.equal(model.steps[1].actionLabel, "Create wallet or link Nautilus");
+});

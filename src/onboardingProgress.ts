@@ -92,17 +92,17 @@ export const deriveOnboardingProgress = (input: DeriveOnboardingStepsInput): Onb
           ? "Dynamic identity found. Finish Dynamic -> Day1 Session to complete."
           : "No active Dynamic identity or Day1 session detected.",
       action: "dynamic_sync",
-      actionLabel: "Complete account connection",
+      actionLabel: "Reconnect Day1 session",
       required: true,
     },
     {
       id: "wallet_linked",
       title: "Step 2: Secure your account",
-      description: "Create a secure wallet so your account setup is protected and tied to you.",
+      description: "Create a secure wallet or link Nautilus so your account setup is protected and tied to you.",
       status: step2Status,
       evidence: toWalletEvidence(input.walletLinked, input.walletAddress),
       action: "create_wallet",
-      actionLabel: "Create secure wallet",
+      actionLabel: "Create wallet or link Nautilus",
       required: true,
     },
     {

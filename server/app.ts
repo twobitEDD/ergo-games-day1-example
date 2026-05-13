@@ -29,6 +29,7 @@ import { Day1SettlementPolicy } from "./runtime/settlement-policy";
 import { buildTruthLedgerView } from "./truth-ledger";
 import { getRatificationEnvDebugSnapshot } from "./env";
 import { createDynamicTokenVerifierFromEnv, type DynamicTokenVerifier } from "./dynamic-auth";
+import { createVrfAdapterFromEnv } from "./vrf-adapter";
 
 const SESSION_HEADER = "x-day1-session-token";
 const SESSION_COOKIE_NAME = "day1_session";
@@ -299,6 +300,7 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
   const sessionService = new StoreBackedGameSessionService(store);
   const rewardPolicy = new Day1RewardPolicy();
   const settlementPolicy = new Day1SettlementPolicy();
+  const vrfAdapter = createVrfAdapterFromEnv();
   const enableRatificationScheduler = options.enableRatificationScheduler ?? true;
   const dynamicTokenVerifier = options.dynamicTokenVerifier ?? createDynamicTokenVerifierFromEnv();
   if (enableRatificationScheduler) ratificationService.start();
@@ -764,6 +766,9 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
         mode: walletStatus.mode,
         network: walletStatus.network,
         ready: walletStatus.ready,
+      },
+      vrf: {
+        adapterMode: vrfAdapter.getMode(),
       },
       dependencies: {
         database: dbReadiness,
@@ -1612,6 +1617,62 @@ export const createDay1App = (store = new Day1Store(), options: CreateDay1AppOpt
       scaffold: true,
       intent,
       note: "Status transitions are simulated and not blockchain-backed.",
+    });
+  });
+
+  app.post("/api/vrf/test/request", async (req, res) => {
+    const auth = requireAuthForMutation(req, res);
+    if (!auth) return;
+    withIdempotency(req, res, { scope: "vrf:test:request", principalKey: auth.session.userId }, async () => {
+      const gameId = typeof req.body?.gameId === "string" ? req.body.gameId.trim() : "";
+      const contractRef = typeof req.body?.contractRef === "string" ? req.body.contractRef.trim() : "";
+      const maxSubmissions =
+        req.body?.maxSubmissions === undefined ? undefined : Number(req.body.maxSubmissions);
+      const payload = await vrfAdapter.requestRandomness({
+        gameId: gameId || undefined,
+        contractRef: contractRef || undefined,
+        maxSubmissions: Number.isFinite(maxSubmissions) ? Math.max(1, Math.floor(maxSubmissions)) : undefined,
+      });
+      // TODO(day1-vrf-onchain): replace this simulated request path with real Ergo tx creation + contract event subscription.
+      res.status(201).json({
+        scaffold: true,
+        request: payload,
+        note:
+          payload.adapterMode === "mock"
+            ? "Mock mode finalized deterministically. Set DAY1_VRF_ORACLE_URL to exercise live oracle/operator flow."
+            : "Round request sent to VRF oracle. Use sync/status endpoints to observe operator submissions and final seed.",
+      });
+    });
+  });
+
+  app.post("/api/vrf/test/request/:requestId/sync", async (req, res) => {
+    const auth = requireAuthForMutation(req, res);
+    if (!auth) return;
+    withIdempotency(req, res, { scope: `vrf:test:sync:${req.params.requestId}`, principalKey: auth.session.userId }, async () => {
+      const payload = await vrfAdapter.syncRequest(req.params.requestId);
+      res.json({ scaffold: true, request: payload });
+    });
+  });
+
+  app.get("/api/vrf/test/request/:requestId/status", (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const payload = vrfAdapter.getRequest(req.params.requestId);
+    if (!payload) {
+      res.status(404).json({ error: "VRF_REQUEST_NOT_FOUND" });
+      return;
+    }
+    res.json({ scaffold: true, request: payload });
+  });
+
+  app.get("/api/vrf/test/requests", (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 20) || 20));
+    res.json({
+      scaffold: true,
+      requests: vrfAdapter.listRequests(limit),
+      adapterMode: vrfAdapter.getMode(),
     });
   });
 

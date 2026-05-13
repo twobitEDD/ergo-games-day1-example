@@ -183,6 +183,11 @@ h1 {
   margin-bottom: 0;
 }
 
+.quickStateLabel {
+  margin: 0.35rem 0 0.45rem;
+  color: var(--color-text-muted);
+}
+
 .onboardingDots {
   display: flex;
   gap: 0.45rem;

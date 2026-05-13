@@ -89,6 +89,13 @@ Flow (text diagram):
 - `POST /api/onchain/intent/create`
 - `GET /api/onchain/intent/:intentId/status`
 
+### VRF test flow (adapter-backed)
+
+- `POST /api/vrf/test/request`
+- `POST /api/vrf/test/request/:requestId/sync`
+- `GET /api/vrf/test/request/:requestId/status`
+- `GET /api/vrf/test/requests`
+
 ### Ratification and server wallet
 
 - `GET /api/health`
@@ -340,6 +347,11 @@ DAY1_CORS_ALLOWED_ORIGINS=https://<your-railway-domain>
 DAY1_TOTP_ENCRYPTION_KEY=<strong-random-value>
 DAY1_CHAIN_NETWORK=testnet
 DAY1_ERGO_NODE_URL=https://api-testnet.ergoplatform.com
+
+# VRF adapter for Day1 randomness tests
+DAY1_VRF_ADAPTER_MODE=http_oracle   # mock | http_oracle
+DAY1_VRF_ORACLE_URL=https://<vrf-coordinator>.up.railway.app
+DAY1_VRF_MAX_SUBMISSIONS=2
 ```
 
 If frontend and API are split across different domains, set
@@ -384,6 +396,21 @@ Readiness checks:
 - No external SIEM/alerting integration yet (local SQLite audit/metrics only)
 - No native in-process Ergo signing library is bundled here; real mode assumes an external signer handoff and signed tx return path.
 - Explorer/node response fields vary by deployment; adapter parsing is resilient but should be validated against your exact endpoint versions.
+- VRF adapter currently supports deterministic mock mode and HTTP oracle integration; native Ergo contract transaction flow remains TODO.
+
+## Day1 VRF Test Runbook
+
+1. Open Day1 and sign in (Dynamic or guest).
+2. In `10) VRF Test Adapter`, set contract reference and max submissions.
+3. Click `Request VRF`.
+4. Click `Sync / Finalize` until status is `finalized`.
+5. Confirm a 64-char `seedHex` appears in the panel and event log.
+
+Notes:
+
+- In `mock` mode, request finalizes immediately with deterministic seed.
+- In `http_oracle` mode, finalization depends on active VRF operator services submitting entropy.
+- For Railway topology/env/deploy commands and verification steps, see `docs/vrf-railway-runbook.md`.
 
 ## Real Mode Smoke Commands
 
